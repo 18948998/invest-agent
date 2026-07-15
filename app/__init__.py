@@ -1,0 +1,2 @@
+"""Local stock-agent package."""
+
