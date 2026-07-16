@@ -1,0 +1,161 @@
+dataset:
+  dataset_id: income_statement
+  dataset_name_zh: 利润表
+  statement_type: financial_statement
+  version: 1
+  description: 用于定义利润表标准字段及其中文名称、来源字段映射。
+
+fields:
+  - name: symbol
+    label_zh: 股票代码
+    source_keys:
+      akshare: 股票代码
+    dtype: string
+    unit: null
+    required: true
+    description: 证券唯一标识。
+  - name: name
+    label_zh: 股票名称
+    source_keys:
+      akshare: 股票简称
+    dtype: string
+    unit: null
+    required: false
+    description: 证券简称。
+  - name: report_date
+    label_zh: 报告期
+    source_keys:
+      akshare: 报告期
+    dtype: date
+    unit: null
+    required: true
+    description: 财报所属报告期。
+  - name: announce_date
+    label_zh: 公告日期
+    source_keys:
+      akshare: 公告日期
+    dtype: date
+    unit: null
+    required: false
+    description: 财报对外公告日期。
+  - name: total_revenue
+    label_zh: 营业总收入
+    source_keys:
+      akshare: 营业总收入
+    dtype: float
+    unit: 元
+    required: false
+    description: 全部营业收入总和。
+  - name: revenue
+    label_zh: 营业收入
+    source_keys:
+      akshare: 营业收入
+    dtype: float
+    unit: 元
+    required: true
+    description: 主营业务及其他经营收入。
+  - name: operating_cost
+    label_zh: 营业成本
+    source_keys:
+      akshare: 营业成本
+    dtype: float
+    unit: 元
+    required: false
+    description: 对应营业收入的直接成本。
+  - name: selling_expense
+    label_zh: 销售费用
+    source_keys:
+      akshare: 销售费用
+    dtype: float
+    unit: 元
+    required: false
+    description: 销售和推广相关费用。
+  - name: administrative_expense
+    label_zh: 管理费用
+    source_keys:
+      akshare: 管理费用
+    dtype: float
+    unit: 元
+    required: false
+    description: 管理活动相关费用。
+  - name: research_and_development_expense
+    label_zh: 研发费用
+    source_keys:
+      akshare: 研发费用
+    dtype: float
+    unit: 元
+    required: false
+    description: 研发投入金额。
+  - name: financial_expense
+    label_zh: 财务费用
+    source_keys:
+      akshare: 财务费用
+    dtype: float
+    unit: 元
+    required: false
+    description: 利息及汇兑等财务费用。
+  - name: operating_profit
+    label_zh: 营业利润
+    source_keys:
+      akshare: 营业利润
+    dtype: float
+    unit: 元
+    required: true
+    description: 主营经营活动形成的利润。
+  - name: total_profit
+    label_zh: 利润总额
+    source_keys:
+      akshare: 利润总额
+    dtype: float
+    unit: 元
+    required: false
+    description: 税前利润总额。
+  - name: income_tax_expense
+    label_zh: 所得税费用
+    source_keys:
+      akshare: 所得税费用
+    dtype: float
+    unit: 元
+    required: false
+    description: 报告期计提所得税费用。
+  - name: net_profit
+    label_zh: 净利润
+    source_keys:
+      akshare: 净利润
+    dtype: float
+    unit: 元
+    required: true
+    description: 税后净利润。
+  - name: net_profit_attributable_to_parent
+    label_zh: 归母净利润
+    source_keys:
+      akshare: 归属于母公司股东的净利润
+    dtype: float
+    unit: 元
+    required: true
+    description: 归属于母公司股东的净利润。
+  - name: net_profit_excluding_non_recurring
+    label_zh: 扣非净利润
+    source_keys:
+      akshare: 扣除非经常性损益后的净利润
+    dtype: float
+    unit: 元
+    required: false
+    description: 扣除非经常性损益后的净利润。
+  - name: eps_basic
+    label_zh: 基本每股收益
+    source_keys:
+      akshare: 基本每股收益
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 基本口径每股收益。
+  - name: eps_diluted
+    label_zh: 稀释每股收益
+    source_keys:
+      akshare: 稀释每股收益
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 稀释口径每股收益。
+

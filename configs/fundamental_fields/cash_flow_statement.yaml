@@ -1,0 +1,105 @@
+dataset:
+  dataset_id: cash_flow_statement
+  dataset_name_zh: 现金流量表
+  statement_type: financial_statement
+  version: 1
+  description: 用于定义现金流量表标准字段及其中文名称、来源字段映射。
+
+fields:
+  - name: symbol
+    label_zh: 股票代码
+    source_keys:
+      akshare: 股票代码
+    dtype: string
+    unit: null
+    required: true
+    description: 证券唯一标识。
+  - name: name
+    label_zh: 股票名称
+    source_keys:
+      akshare: 股票简称
+    dtype: string
+    unit: null
+    required: false
+    description: 证券简称。
+  - name: report_date
+    label_zh: 报告期
+    source_keys:
+      akshare: 报告期
+    dtype: date
+    unit: null
+    required: true
+    description: 财报所属报告期。
+  - name: announce_date
+    label_zh: 公告日期
+    source_keys:
+      akshare: 公告日期
+    dtype: date
+    unit: null
+    required: false
+    description: 财报对外公告日期。
+  - name: cash_inflow_from_operating_activities
+    label_zh: 经营活动现金流入小计
+    source_keys:
+      akshare: 经营活动产生的现金流量流入小计
+    dtype: float
+    unit: 元
+    required: false
+    description: 经营活动现金流入总额。
+  - name: cash_outflow_from_operating_activities
+    label_zh: 经营活动现金流出小计
+    source_keys:
+      akshare: 经营活动产生的现金流量流出小计
+    dtype: float
+    unit: 元
+    required: false
+    description: 经营活动现金流出总额。
+  - name: net_cash_flow_from_operating_activities
+    label_zh: 经营活动现金流量净额
+    source_keys:
+      akshare: 经营活动产生的现金流量净额
+    dtype: float
+    unit: 元
+    required: true
+    description: 经营活动现金净流入。
+  - name: cash_paid_for_long_term_assets
+    label_zh: 购建固定资产等支付的现金
+    source_keys:
+      akshare: 购建固定资产、无形资产和其他长期资产支付的现金
+    dtype: float
+    unit: 元
+    required: false
+    description: 资本开支的核心原始字段。
+  - name: net_cash_flow_from_investing_activities
+    label_zh: 投资活动现金流量净额
+    source_keys:
+      akshare: 投资活动产生的现金流量净额
+    dtype: float
+    unit: 元
+    required: false
+    description: 投资活动现金净流入或净流出。
+  - name: net_cash_flow_from_financing_activities
+    label_zh: 筹资活动现金流量净额
+    source_keys:
+      akshare: 筹资活动产生的现金流量净额
+    dtype: float
+    unit: 元
+    required: false
+    description: 筹资活动现金净流入或净流出。
+  - name: net_increase_in_cash_and_equivalents
+    label_zh: 现金及现金等价物净增加额
+    source_keys:
+      akshare: 现金及现金等价物净增加额
+    dtype: float
+    unit: 元
+    required: false
+    description: 报告期现金净增加额。
+  - name: ending_cash_and_equivalents_balance
+    label_zh: 期末现金及现金等价物余额
+    source_keys:
+      akshare: 期末现金及现金等价物余额
+    dtype: float
+    unit: 元
+    required: false
+    description: 报告期末现金余额。
+

@@ -1,0 +1,161 @@
+dataset:
+  dataset_id: balance_sheet
+  dataset_name_zh: 资产负债表
+  statement_type: financial_statement
+  version: 1
+  description: 用于定义资产负债表标准字段及其中文名称、来源字段映射。
+
+fields:
+  - name: symbol
+    label_zh: 股票代码
+    source_keys:
+      akshare: 股票代码
+    dtype: string
+    unit: null
+    required: true
+    description: 证券唯一标识。
+  - name: name
+    label_zh: 股票名称
+    source_keys:
+      akshare: 股票简称
+    dtype: string
+    unit: null
+    required: false
+    description: 证券简称。
+  - name: report_date
+    label_zh: 报告期
+    source_keys:
+      akshare: 报告期
+    dtype: date
+    unit: null
+    required: true
+    description: 财报所属报告期。
+  - name: announce_date
+    label_zh: 公告日期
+    source_keys:
+      akshare: 公告日期
+    dtype: date
+    unit: null
+    required: false
+    description: 财报对外公告日期。
+  - name: cash_and_equivalents
+    label_zh: 货币资金
+    source_keys:
+      akshare: 货币资金
+    dtype: float
+    unit: 元
+    required: false
+    description: 企业持有的现金及现金等价物。
+  - name: accounts_receivable
+    label_zh: 应收账款
+    source_keys:
+      akshare: 应收账款
+    dtype: float
+    unit: 元
+    required: false
+    description: 企业应收未收回账款。
+  - name: inventory
+    label_zh: 存货
+    source_keys:
+      akshare: 存货
+    dtype: float
+    unit: 元
+    required: false
+    description: 原材料、在产品、库存商品等。
+  - name: total_current_assets
+    label_zh: 流动资产合计
+    source_keys:
+      akshare: 流动资产合计
+    dtype: float
+    unit: 元
+    required: false
+    description: 一年内可变现的资产总额。
+  - name: fixed_assets
+    label_zh: 固定资产
+    source_keys:
+      akshare: 固定资产
+    dtype: float
+    unit: 元
+    required: false
+    description: 房屋、设备等长期使用资产。
+  - name: intangible_assets
+    label_zh: 无形资产
+    source_keys:
+      akshare: 无形资产
+    dtype: float
+    unit: 元
+    required: false
+    description: 专利、商标、土地使用权等。
+  - name: goodwill
+    label_zh: 商誉
+    source_keys:
+      akshare: 商誉
+    dtype: float
+    unit: 元
+    required: false
+    description: 并购形成的商誉余额。
+  - name: total_assets
+    label_zh: 总资产
+    source_keys:
+      akshare: 资产总计
+    dtype: float
+    unit: 元
+    required: true
+    description: 企业全部资产总额。
+  - name: short_term_borrowings
+    label_zh: 短期借款
+    source_keys:
+      akshare: 短期借款
+    dtype: float
+    unit: 元
+    required: false
+    description: 一年内到期的有息借款。
+  - name: total_current_liabilities
+    label_zh: 流动负债合计
+    source_keys:
+      akshare: 流动负债合计
+    dtype: float
+    unit: 元
+    required: false
+    description: 一年内需要偿还的负债总额。
+  - name: long_term_borrowings
+    label_zh: 长期借款
+    source_keys:
+      akshare: 长期借款
+    dtype: float
+    unit: 元
+    required: false
+    description: 一年以上有息借款。
+  - name: total_liabilities
+    label_zh: 总负债
+    source_keys:
+      akshare: 负债合计
+    dtype: float
+    unit: 元
+    required: true
+    description: 企业全部负债总额。
+  - name: share_capital
+    label_zh: 股本
+    source_keys:
+      akshare: 股本
+    dtype: float
+    unit: 股
+    required: false
+    description: 实收资本或股本规模。
+  - name: retained_earnings
+    label_zh: 未分配利润
+    source_keys:
+      akshare: 未分配利润
+    dtype: float
+    unit: 元
+    required: false
+    description: 企业历年累计未分配利润。
+  - name: equity_attributable_to_parent
+    label_zh: 归母股东权益
+    source_keys:
+      akshare: 归属于母公司股东权益合计
+    dtype: float
+    unit: 元
+    required: true
+    description: 归属于母公司普通股股东的净资产。
+

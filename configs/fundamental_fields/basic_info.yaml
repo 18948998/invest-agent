@@ -1,0 +1,145 @@
+dataset:
+  dataset_id: basic_info
+  dataset_name_zh: 基础信息表
+  statement_type: reference_and_valuation
+  version: 1
+  description: 用于定义估值、每股指标、分红和公司基础信息字段。
+
+fields:
+  - name: symbol
+    label_zh: 股票代码
+    source_keys:
+      akshare: 股票代码
+    dtype: string
+    unit: null
+    required: true
+    description: 证券唯一标识。
+  - name: name
+    label_zh: 股票名称
+    source_keys:
+      akshare: 股票简称
+    dtype: string
+    unit: null
+    required: false
+    description: 证券简称。
+  - name: market
+    label_zh: 所属市场
+    source_keys:
+      akshare: 市场
+    dtype: string
+    unit: null
+    required: false
+    description: 证券交易市场。
+  - name: industry
+    label_zh: 所属行业
+    source_keys:
+      akshare: 行业
+    dtype: string
+    unit: null
+    required: false
+    description: 行业分类。
+  - name: listing_date
+    label_zh: 上市日期
+    source_keys:
+      akshare: 上市日期
+    dtype: date
+    unit: null
+    required: false
+    description: 证券首次上市日期。
+  - name: current_price
+    label_zh: 当前价格
+    source_keys:
+      akshare: 最新价
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 当前或最近交易价格。
+  - name: pe_ttm
+    label_zh: 市盈率(PE-TTM)
+    source_keys:
+      akshare: 市盈率TTM
+    dtype: float
+    unit: 倍
+    required: false
+    description: 滚动市盈率。
+  - name: pb
+    label_zh: 市净率(PB)
+    source_keys:
+      akshare: 市净率
+    dtype: float
+    unit: 倍
+    required: false
+    description: 市净率。
+  - name: ps_ttm
+    label_zh: 市销率(PS-TTM)
+    source_keys:
+      akshare: 市销率TTM
+    dtype: float
+    unit: 倍
+    required: false
+    description: 滚动市销率。
+  - name: market_cap
+    label_zh: 总市值
+    source_keys:
+      akshare: 总市值
+    dtype: float
+    unit: 元
+    required: false
+    description: 公司总市值。
+  - name: eps_basic
+    label_zh: 基本每股收益
+    source_keys:
+      akshare: 基本每股收益
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 每股收益基础口径。
+  - name: eps_ttm
+    label_zh: 每股收益(EPS-TTM)
+    source_keys:
+      akshare: 每股收益TTM
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 滚动每股收益。
+  - name: bvps
+    label_zh: 每股净资产
+    source_keys:
+      akshare: 每股净资产
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 每股净资产。
+  - name: dividend_per_share
+    label_zh: 每股股利
+    source_keys:
+      akshare: 每股派息
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 每股现金分红。
+  - name: dividend_payout_ratio
+    label_zh: 分红率
+    source_keys:
+      akshare: 分红率
+    dtype: float
+    unit: 比例
+    required: false
+    description: 分红占净利润比率。
+  - name: dividend_yield
+    label_zh: 股息率
+    source_keys:
+      akshare: 股息率
+    dtype: float
+    unit: 比例
+    required: false
+    description: 现金股息率。
+  - name: roe
+    label_zh: 净资产收益率(ROE)
+    source_keys:
+      akshare: 净资产收益率
+    dtype: float
+    unit: 比例
+    required: false
+    description: 净资产收益率。
+
