@@ -51,14 +51,16 @@ def normalize_records(
     dataset_spec: DatasetSpec,
     raw_records: list[dict[str, Any]],
     source: str,
-+) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for raw_row in raw_records:
         row: dict[str, Any] = {}
         for field in dataset_spec.fields:
-            source_key = field.source_keys.get(source)
+            source_key = field.source_keys.get(source) or field.source_keys.get("akshare")
             raw_value = raw_row.get(source_key) if source_key else None
             row[field.name] = _coerce_value(field, raw_value)
         normalized.append(row)
     return normalized
+
+
 

@@ -4,4 +4,5 @@ pydantic==2.13.4
 PyYAML==6.0.3
 pandas==3.0.3
 rich==15.0.0
+requests==2.34.2
 
