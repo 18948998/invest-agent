@@ -1,0 +1,2 @@
+"""Service adapter package placeholders."""
+
