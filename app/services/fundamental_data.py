@@ -243,7 +243,8 @@ def _parse_tencent(text: str) -> list[dict[str, Any]]:
 			continue
 		pe = _to_float(fields[39]) if len(fields) > 39 else None
 		pb = _to_float(fields[46]) if len(fields) > 46 else None
-		market_cap = _to_float(fields[44]) if len(fields) > 44 else None
+		market_cap_raw = _to_float(fields[44]) if len(fields) > 44 else None
+		market_cap = market_cap_raw * 1e8 if market_cap_raw is not None else None  # 腾讯API返回亿→转为元
 		rows.append(_build_row(code, fields[1], _to_float(fields[3]), pe=pe, pb=pb, market_cap=market_cap))
 	return rows
 

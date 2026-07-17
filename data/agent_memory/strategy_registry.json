@@ -1,0 +1,30 @@
+{
+  "strategies": {
+    "graham": {
+      "name": "格雷厄姆价值",
+      "description": "低PE(0-15)、低PB(<1.5)、高ROE(≥10%)、有分红、市值≥50亿",
+      "file": "configs/strategies/graham.yaml",
+      "tags": [
+        "价值",
+        "低估值",
+        "安全边际"
+      ],
+      "created_at": "2026-07-17"
+    },
+    "超低估": {
+      "name": "超低估",
+      "description": "超低估",
+      "file": "C:\\Users\\33596\\PycharmProjects\\invest-agent\\configs\\strategies\\超低估.yaml",
+      "tags": [],
+      "created_at": "2026-07-17"
+    },
+    "defance-strategy": {
+      "name": "defance-strategy",
+      "description": "defance-strategy",
+      "file": "C:\\Users\\33596\\PycharmProjects\\invest-agent\\configs\\strategies\\defance-strategy.yaml",
+      "tags": [],
+      "created_at": "2026-07-17"
+    }
+  },
+  "default": "graham"
+}

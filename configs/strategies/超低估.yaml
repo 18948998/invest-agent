@@ -1,0 +1,15 @@
+review:
+  require_confirm: false
+screen:
+  description: 超低估
+  hard_filters:
+    pb:
+      max: 0.8
+    pe_ttm:
+      max: 10
+    roe:
+      min: 15
+universe:
+  exclude_st: true
+  market: A股
+  min_listing_days: 365

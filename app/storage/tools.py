@@ -21,8 +21,6 @@ from typing import Any
 
 from langchain_core.tools import tool
 
-from app.services.data_refresher import ensure_data_fresh
-
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
@@ -111,7 +109,7 @@ _SQL_KEYWORDS: frozenset[str] = frozenset({
     "INTEGER", "REAL", "TEXT", "BLOB", "NUMERIC",
     "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "INDEX",
     "UNIQUE", "CHECK", "DEFAULT", "CONSTRAINT", "TABLE",
-    "USING", "NATURAL", "UNION", "INTERSECT", "EXCEPT",
+    "USING", "NATURAL", "INTERSECT", "EXCEPT",
     "OVER", "PARTITION", "ROWS", "RANGE", "PRECEDING",
     "FOLLOWING", "UNBOUNDED", "CURRENT", "ROW", "FIRST",
     "LAST", "VALUES", "FILTER", "RECURSIVE", "MATERIALIZED",
@@ -276,6 +274,7 @@ Args:
         return f"查询被拒绝: {err}"
 
     # ---- 检查数据新鲜度，过期则后台刷新 ----
+    from app.services.data_refresher import ensure_data_fresh
     _ = ensure_data_fresh(db_path)
 
     db = Path(db_path)
@@ -307,6 +306,7 @@ Args:
   db_path: SQLite 数据库文件路径。
 """
     # ---- 检查数据新鲜度，过期则后台刷新 ----
+    from app.services.data_refresher import ensure_data_fresh
     _ = ensure_data_fresh(db_path)
 
     table_labels = {

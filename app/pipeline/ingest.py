@@ -101,62 +101,49 @@ def _enrich_eps_from_db(db_path: Path, raw_records: list[dict[str, object]], sou
 
 
 def _enrich_price_metrics(db_path: Path, _unused: int) -> None:
-    """用已落库的财报数据，回填 basic_info 的 name / PE / PB / market_cap。"""
+    """用财报数据回填 basic_info 的缺失股票名称。
+
+    PE / PB / 市值直接使用腾讯行情 API 的原始返回值，不再用财报反算覆盖。
+    原因：eps_basic 可能是单季报数据，price / eps_basic 会严重高估 PE。
+    """
     try:
         with sqlite3.connect(db_path) as conn:
-            # 1. 股票名称
             conn.execute("""\
                 UPDATE basic_info SET name = (
                     SELECT s.name FROM income_statement s
                     WHERE s.symbol = basic_info.symbol LIMIT 1
                 ) WHERE name IS NULL""")
-
-            # 2. PE = current_price / eps_basic
-            conn.execute("""\
-                UPDATE basic_info SET pe_ttm = current_price / eps_basic
-                WHERE current_price IS NOT NULL AND eps_basic IS NOT NULL AND eps_basic > 0""")
-
-            # 3. 总股本 = 归母净利润 / eps_basic（从利润表）
-            conn.execute("""\
-                UPDATE basic_info SET market_cap = current_price * (
-                    SELECT i.net_profit_attributable_to_parent / i.eps_basic
-                    FROM income_statement i
-                    WHERE i.symbol = basic_info.symbol AND i.eps_basic > 0
-                    LIMIT 1
-                )
-                WHERE current_price IS NOT NULL""")
-
-            # 4. PB = current_price / (归母权益 / 总股本)
-            conn.execute("""\
-                UPDATE basic_info SET pb = 
-                    current_price / (
-                        SELECT b.equity_attributable_to_parent / (i.net_profit_attributable_to_parent / i.eps_basic)
-                        FROM balance_sheet b
-                        JOIN income_statement i ON i.symbol = b.symbol AND i.eps_basic > 0
-                        WHERE b.symbol = basic_info.symbol
-                        LIMIT 1
-                    )
-                WHERE current_price IS NOT NULL AND market_cap IS NOT NULL""")
-
             conn.commit()
             updated = conn.total_changes
     except sqlite3.OperationalError:
         updated = 0
     if updated:
-        print(f"【指标计算】已补充 name / PE / PB / 市值，{updated} 条更新。")
+        print(f"【指标计算】已补充 stock name，{updated} 条更新。")
 
 
-def _cache_valid_codes(db_path: Path) -> None:
-    """从 basic_info 表提取有股价的 A 股代码写入持久化文件。"""
-    try:
-        with sqlite3.connect(db_path) as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM basic_info WHERE current_price IS NOT NULL"
-            ).fetchall()
-        codes = [r[0] for r in rows if r[0] and is_main_gem_star_symbol(str(r[0]))]
-        save_valid_codes_from_rows([{"股票代码": c} for c in codes])
-    except Exception:
-        pass
+def _cache_valid_codes(db_path: Path, symbols: set[str] | None = None) -> None:
+    """将有效 A 股代码写入持久化文件（覆盖写入，不会累积）。
+
+    Args:
+        db_path: 数据库路径（仅用于兼容旧调用，symbols 非空时不使用）。
+        symbols:  本次采集得到的有股价的股票代码集合。若为空则从 basic_info 表兜底提取。
+    """
+    codes: list[str]
+    if symbols:
+        codes = sorted(s for s in symbols if s and is_main_gem_star_symbol(s))
+    else:
+        try:
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT symbol FROM basic_info WHERE current_price IS NOT NULL"
+                ).fetchall()
+            codes = sorted(
+                r[0] for r in rows if r[0] and is_main_gem_star_symbol(str(r[0]))
+            )
+        except Exception:
+            return
+
+    save_valid_codes_from_rows([{"股票代码": c} for c in codes])
 
 
 def _run_price_parallel(
@@ -176,6 +163,7 @@ def _run_price_parallel(
     results: dict[str, Any] = {
         "total_row_count": 0,
         "price_success_count": 0,
+        "valid_symbols": set(),  # 本次采集的有股价 symbol，用于重建 valid_codes.json
         "batch_count": 0,
         "sample_row": None,
         "total_batches": total_batches,
@@ -208,6 +196,11 @@ def _run_price_parallel(
                 results["price_success_count"] += sum(
                     1 for r in normalized if r.get("current_price") is not None
                 )
+                # 收集本次采集的有效 symbol（用于重建 valid_codes.json）
+                for r in normalized:
+                    sym = r.get("symbol")
+                    if sym and r.get("current_price") is not None:
+                        results["valid_symbols"].add(sym)
             validation = validate_records(spec, normalized)
             save_dataset(db_path=db_path, dataset_spec=spec, rows=normalized, replace=False)
             _print_saved_rows(spec.meta.dataset_id, batch_no, total_batches, normalized, spec)
@@ -227,8 +220,8 @@ def _run_price_parallel(
     t1.join()
     t2.join()
 
-    # 从 DB 中提取有效代码写入缓存
-    _cache_valid_codes(db_path)
+    # 用本次采集结果重建 valid_codes.json（不从 DB 读，避免旧数据混入）
+    _cache_valid_codes(db_path, symbols=results["valid_symbols"])
 
     # 全部落库后，从财报数据补充 name / PE / PB / 市值
     _enrich_price_metrics(db_path, results["price_success_count"])
