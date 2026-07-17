@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.config.schema import DatasetSpec
+
+logger = logging.getLogger(__name__)
 
 
 def _sqlite_type(dtype: str) -> str:
@@ -120,6 +124,73 @@ def get_all_update_history(db_path: Path) -> list[dict[str, Any]]:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute("SELECT * FROM update_history ORDER BY track")
         return [dict(row) for row in cursor.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# data freshness – check if cached data is too old
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class DataFreshness:
+    """一次数据新鲜度检查的结果。"""
+    is_price_stale: bool      # basic_info 是否过期（> 1 天）
+    is_financial_stale: bool  # 三张财报是否过期（> 1 个月）
+    price_last_update: str | None
+    financial_last_update: str | None
+    db_path: Path
+
+    @property
+    def any_stale(self) -> bool:
+        return self.is_price_stale or self.is_financial_stale
+
+    @property
+    def stale_tracks(self) -> list[str]:
+        tracks: list[str] = []
+        if self.is_price_stale:
+            tracks.append("price")
+        if self.is_financial_stale:
+            tracks.append("financial")
+        return tracks
+
+
+def check_data_freshness(db_path: Path) -> DataFreshness:
+    """检查数据库中各类数据的最后更新时间。
+
+    basic_info（股价/估值）超过 1 天 → price_stale
+    财报三表超过 1 个月 → financial_stale
+    """
+    now = datetime.now(timezone.utc)
+
+    price_record = get_last_update(db_path, "price")
+    financial_record = get_last_update(db_path, "financial")
+
+    _price_last = price_record["updated_at"] if price_record else None
+    _fin_last = financial_record["updated_at"] if financial_record else None
+
+    price_stale = True
+    financial_stale = True
+
+    if _price_last:
+        try:
+            last = datetime.strptime(_price_last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            price_stale = (now - last) > timedelta(days=1)
+        except ValueError:
+            pass
+
+    if _fin_last:
+        try:
+            last = datetime.strptime(_fin_last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            financial_stale = (now - last) > timedelta(days=30)
+        except ValueError:
+            pass
+
+    return DataFreshness(
+        is_price_stale=price_stale,
+        is_financial_stale=financial_stale,
+        price_last_update=_price_last,
+        financial_last_update=_fin_last,
+        db_path=db_path,
+    )
 
 
 def get_latest_eps_batch(db_path: Path, symbols: list[str]) -> dict[str, dict[str, Any]]:

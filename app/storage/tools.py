@@ -8,6 +8,7 @@
 - 仅允许 SELECT 语句
 - 字段名白名单校验（阻止 SQL 注入）
 - 结果行数上限防止上下文溢出
+- 每次查询自动检查数据新鲜度，过期则后台静默刷新
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
+
+from app.services.data_refresher import ensure_data_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +275,9 @@ Args:
         logger.warning("SQL 校验拒绝: %s | SQL: %.200s", err, sql)
         return f"查询被拒绝: {err}"
 
+    # ---- 检查数据新鲜度，过期则后台刷新 ----
+    _ = ensure_data_fresh(db_path)
+
     db = Path(db_path)
     if not db.exists():
         return f"数据库文件不存在: {db_path}"
@@ -300,6 +306,9 @@ def list_tables(db_path: str) -> str:
 Args:
   db_path: SQLite 数据库文件路径。
 """
+    # ---- 检查数据新鲜度，过期则后台刷新 ----
+    _ = ensure_data_fresh(db_path)
+
     table_labels = {
         "basic_info": "基础信息与估值指标（每只股票一行）",
         "income_statement": "利润表（多期，按 report_date 区分）",
