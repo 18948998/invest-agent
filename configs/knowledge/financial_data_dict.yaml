@@ -1,0 +1,767 @@
+# =============================================================================
+#  财务数据字典 —— ScreenAgent 与 AnalyzeAgent 共享的外部会计知识
+#
+#  用途：子 agent 执行任务时将本文件内容注入 LLM 上下文，使其知晓：
+#        1. 有哪些数据表，每张表里有什么字段，每个字段的中文名和含义
+#        2. 有哪些系统会自动计算出来的衍生字段，公式是什么
+#        3. 常用的财务概念对应哪些公式和数据来源
+#
+#  维护：新增字段/概念只需改此文件，所有 agent 自动生效。
+#        字段定义与 configs/fundamental_fields/*.yaml（ingest 用）保持一致。
+# =============================================================================
+
+
+# =============================================================================
+#  一、五张数据表，每张表的字段 → 中文名 → 单位 → 含义
+# =============================================================================
+
+tables:
+
+  # ------------------------------------------------------------------
+  #  basic_info —— 基础信息与实时估值
+  # ------------------------------------------------------------------
+  basic_info:
+    name_zh: 基础信息表（实时行情与估值）
+    description: >
+      每只股票一行。当前价格和 PE/PB/市值等估值指标来自腾讯行情 API。
+      行业、上市日期、ROE、股息率等字段当前数据源未填充，通常为 NULL。
+    primary_key: symbol
+    fields:
+      - name: symbol
+        label_zh: 股票代码
+        aliases: [股票代码, 代码]
+        unit: null
+        description: 6 位数字。上证以 60 开头，深证以 00 或 30 开头。
+
+      - name: name
+        label_zh: 股票名称
+        aliases: [股票简称, 名称, 简称]
+        unit: null
+        description: 证券中文简称。
+
+      - name: market
+        label_zh: 所属市场
+        aliases: [市场, 交易所]
+        unit: null
+        description: 上交所或深交所。
+
+      - name: industry
+        label_zh: 所属行业
+        aliases: [行业]
+        unit: null
+        description: 行业分类。当前数据源未填充，通常为 NULL。
+
+      - name: listing_date
+        label_zh: 上市日期
+        aliases: [上市日期]
+        unit: null
+        description: 首次上市日期。
+
+      - name: current_price
+        label_zh: 当前价格
+        aliases: [股价, 最新价, 当前价, price]
+        unit: 元/股
+        description: 最近交易日价格。
+
+      - name: pe_ttm
+        label_zh: 滚动市盈率
+        aliases: [市盈率, PE, pe_ttm]
+        unit: 倍
+        description: 股价 ÷ 最近四个季度每股收益之和。
+
+      - name: pb
+        label_zh: 市净率
+        aliases: [市净率, PB, 账面值比]
+        unit: 倍
+        description: 股价 ÷ 每股净资产。
+
+      - name: ps_ttm
+        label_zh: 滚动市销率
+        aliases: [市销率, PS]
+        unit: 倍
+        description: 总市值 ÷ 最近四个季度营业收入总额。
+
+      - name: market_cap
+        label_zh: 总市值
+        aliases: [市值, 总市值]
+        unit: 元
+        description: 公司总市值。1 亿 = 1e8，如"50 亿"对应 5,000,000,000。
+
+      - name: eps_basic
+        label_zh: 基本每股收益
+        aliases: [每股收益, 每股利润, EPS, eps]
+        unit: 元/股
+        description: 基本口径每股收益，来自最新年报。
+
+      - name: eps_ttm
+        label_zh: 每股收益 TTM
+        aliases: [每股收益TTM]
+        unit: 元/股
+        description: 最近四个季度每股收益之和。
+
+      - name: bvps
+        label_zh: 每股净资产
+        aliases: [每股净资产]
+        unit: 元/股
+        description: 归母净资产 ÷ 总股本。
+
+      - name: dividend_per_share
+        label_zh: 每股股利
+        aliases: [每股派息, 每股股利, 每股分红]
+        unit: 元/股
+        description: 每股现金分红。当前数据源未填充，通常为 NULL。
+
+      - name: dividend_payout_ratio
+        label_zh: 分红率
+        aliases: [分红率, 派息率]
+        unit: 比例
+        description: 现金分红 ÷ 净利润。当前数据源未填充，通常为 NULL。
+
+      - name: dividend_yield
+        label_zh: 股息率
+        aliases: [股息率, 分红收益率]
+        unit: 比例
+        description: 每股现金分红 ÷ 当前股价。当前数据源未填充，通常为 NULL。
+
+      - name: roe
+        label_zh: 净资产收益率
+        aliases: [净资产收益率, ROE, 股东权益回报]
+        unit: 比例
+        description: 净利润 ÷ 归母净资产。当前数据源未填充，通常为 NULL；此时系统会尝试用 net_profit / equity_attributable_to_parent 兜底计算。
+
+  # ------------------------------------------------------------------
+  #  income_statement —— 利润表
+  # ------------------------------------------------------------------
+  income_statement:
+    name_zh: 利润表
+    description: >
+      多期数据。仅保留年报（report_date 以 "-12-31" 结尾），季报/半年报在入库时已丢弃。
+      历史数据可用于计算 EPS 增长率、连续盈利年数等趋势指标。
+    primary_key: symbol + report_date
+    fields:
+      - name: symbol
+        label_zh: 股票代码
+        aliases: [股票代码]
+        unit: null
+        description: 6 位数字代码。
+
+      - name: name
+        label_zh: 股票名称
+        aliases: [股票简称, 名称]
+        unit: null
+        description: 证券简称。
+
+      - name: report_date
+        label_zh: 报告期
+        aliases: [报告期, 财年]
+        unit: null
+        description: 年报固定为 YYYY-12-31。
+
+      - name: announce_date
+        label_zh: 公告日期
+        aliases: [公告日期]
+        unit: null
+        description: 财报对外公告日期（通常在次年 3-4 月）。
+
+      - name: report_type
+        label_zh: 报告类型
+        aliases: [报告类型]
+        unit: null
+        description: 年度报告。
+
+      - name: total_revenue
+        label_zh: 营业总收入
+        aliases: [营业总收入]
+        unit: 元
+        description: 全部营业收入总和（含其他业务收入）。
+
+      - name: revenue
+        label_zh: 营业收入
+        aliases: [营业收入, 营收, 销售额, 销售收入]
+        unit: 元
+        description: 主营业务收入。
+
+      - name: operating_cost
+        label_zh: 营业成本
+        aliases: [营业成本, 成本]
+        unit: 元
+        description: 对应营业收入的直接成本。
+
+      - name: selling_expense
+        label_zh: 销售费用
+        aliases: [销售费用]
+        unit: 元
+        description: 销售和推广相关费用。
+
+      - name: administrative_expense
+        label_zh: 管理费用
+        aliases: [管理费用]
+        unit: 元
+        description: 管理活动相关费用。
+
+      - name: research_and_development_expense
+        label_zh: 研发费用
+        aliases: [研发费用, 研发投入, R&D]
+        unit: 元
+        description: 研发投入金额。
+
+      - name: financial_expense
+        label_zh: 财务费用
+        aliases: [财务费用, 利息费用]
+        unit: 元
+        description: 利息及汇兑等财务费用。
+
+      - name: operating_profit
+        label_zh: 营业利润
+        aliases: [营业利润]
+        unit: 元
+        description: 主营经营活动形成的利润。
+
+      - name: total_profit
+        label_zh: 利润总额
+        aliases: [利润总额, 税前利润]
+        unit: 元
+        description: 税前利润总额。
+
+      - name: income_tax_expense
+        label_zh: 所得税费用
+        aliases: [所得税, 所得税费用]
+        unit: 元
+        description: 报告期计提所得税费用。
+
+      - name: net_profit
+        label_zh: 净利润
+        aliases: [净利润, 税后利润]
+        unit: 元
+        description: 税后净利润。用于计算连续盈利年数。
+
+      - name: net_profit_attributable_to_parent
+        label_zh: 归母净利润
+        aliases: [归母净利润, 归属母公司净利润]
+        unit: 元
+        description: 归属于母公司股东的净利润。
+
+      - name: net_profit_excluding_non_recurring
+        label_zh: 扣非净利润
+        aliases: [扣非净利润, 扣非净利]
+        unit: 元
+        description: 扣除非经常性损益后的净利润。
+
+      - name: eps_basic
+        label_zh: 基本每股收益
+        aliases: [每股收益, EPS, 基本每股收益]
+        unit: 元/股
+        description: 年报口径基本每股收益。历史数据用于计算 EPS 增长率和 PE(3 年均)。
+
+      - name: eps_diluted
+        label_zh: 稀释每股收益
+        aliases: [稀释每股收益, 稀释EPS]
+        unit: 元/股
+        description: 稀释口径每股收益。
+
+  # ------------------------------------------------------------------
+  #  balance_sheet —— 资产负债表
+  # ------------------------------------------------------------------
+  balance_sheet:
+    name_zh: 资产负债表
+    description: >
+      多期数据。仅保留年报。反映报告期末的资产、负债和所有者权益状况。
+    primary_key: symbol + report_date
+    note: >
+      金融企业（银行、保险）的会计科目与一般企业不同，长期借款等字段可能为 NULL。
+    fields:
+      - name: symbol
+        label_zh: 股票代码
+        aliases: [股票代码]
+        unit: null
+        description: 6 位数字代码。
+
+      - name: name
+        label_zh: 股票名称
+        aliases: [股票简称, 名称]
+        unit: null
+        description: 证券简称。
+
+      - name: report_date
+        label_zh: 报告期
+        aliases: [报告期]
+        unit: null
+        description: 年报固定为 YYYY-12-31。
+
+      - name: announce_date
+        label_zh: 公告日期
+        aliases: [公告日期]
+        unit: null
+        description: 财报对外公告日期。
+
+      - name: report_type
+        label_zh: 报告类型
+        aliases: [报告类型]
+        unit: null
+        description: 年度报告。
+
+      - name: cash_and_equivalents
+        label_zh: 货币资金
+        aliases: [货币资金, 现金]
+        unit: 元
+        description: 企业持有的现金及现金等价物。
+
+      - name: accounts_receivable
+        label_zh: 应收账款
+        aliases: [应收账款, 应收]
+        unit: 元
+        description: 应收未收回账款。
+
+      - name: inventory
+        label_zh: 存货
+        aliases: [存货, 库存]
+        unit: 元
+        description: 原材料、在产品、库存商品等。
+
+      - name: total_current_assets
+        label_zh: 流动资产合计
+        aliases: [流动资产合计, 流动资产]
+        unit: 元
+        description: 一年内可变现资产总额。用于计算流动比率、流动资产净额。
+
+      - name: fixed_assets
+        label_zh: 固定资产
+        aliases: [固定资产]
+        unit: 元
+        description: 房屋、设备等长期使用资产。
+
+      - name: intangible_assets
+        label_zh: 无形资产
+        aliases: [无形资产]
+        unit: 元
+        description: 专利、商标、土地使用权等。
+
+      - name: goodwill
+        label_zh: 商誉
+        aliases: [商誉]
+        unit: 元
+        description: 并购形成的商誉余额。
+
+      - name: total_assets
+        label_zh: 总资产
+        aliases: [总资产, 资产总额, 资产总计]
+        unit: 元
+        description: 企业全部资产总额。资产负债表核心字段。
+
+      - name: short_term_borrowings
+        label_zh: 短期借款
+        aliases: [短期借款, 短期债务]
+        unit: 元
+        description: 一年内到期的有息借款。
+
+      - name: total_current_liabilities
+        label_zh: 流动负债合计
+        aliases: [流动负债合计, 流动负债]
+        unit: 元
+        description: 一年内需偿还的负债总额。用于计算流动比率、流动资产净额。
+
+      - name: long_term_borrowings
+        label_zh: 长期借款
+        aliases: [长期借款, 长期债务, 长期负债]
+        unit: 元
+        description: 一年以上有息借款。金融企业此字段通常为 NULL。
+
+      - name: total_liabilities
+        label_zh: 总负债
+        aliases: [总负债, 负债合计, 负债总额]
+        unit: 元
+        description: 企业全部负债总额。用于计算负债权益比、资产负债率。
+
+      - name: share_capital
+        label_zh: 股本
+        aliases: [股本, 总股本]
+        unit: 股
+        description: 实收资本或股本规模。
+
+      - name: retained_earnings
+        label_zh: 未分配利润
+        aliases: [未分配利润, 留存收益]
+        unit: 元
+        description: 企业历年累计未分配利润。
+
+      - name: equity_attributable_to_parent
+        label_zh: 归母股东权益
+        aliases: [归母股东权益, 归母权益, 股东权益, 净资产, equity]
+        unit: 元
+        description: 归属于母公司普通股股东的净资产。用于计算负债权益比、ROE。
+
+  # ------------------------------------------------------------------
+  #  cash_flow_statement —— 现金流量表
+  # ------------------------------------------------------------------
+  cash_flow_statement:
+    name_zh: 现金流量表
+    description: >
+      多期数据。仅保留年报。反映报告期内现金流入流出情况。
+    primary_key: symbol + report_date
+    fields:
+      - name: symbol
+        label_zh: 股票代码
+        aliases: [股票代码]
+        unit: null
+        description: 6 位数字代码。
+
+      - name: name
+        label_zh: 股票名称
+        aliases: [股票简称, 名称]
+        unit: null
+        description: 证券简称。
+
+      - name: report_date
+        label_zh: 报告期
+        aliases: [报告期]
+        unit: null
+        description: 年报固定为 YYYY-12-31。
+
+      - name: announce_date
+        label_zh: 公告日期
+        aliases: [公告日期]
+        unit: null
+        description: 财报对外公告日期。
+
+      - name: report_type
+        label_zh: 报告类型
+        aliases: [报告类型]
+        unit: null
+        description: 年度报告。
+
+      - name: cash_inflow_from_operating_activities
+        label_zh: 经营活动现金流入小计
+        aliases: [经营活动现金流入, 经营现金流入]
+        unit: 元
+        description: 经营活动现金流入总额。
+
+      - name: cash_outflow_from_operating_activities
+        label_zh: 经营活动现金流出小计
+        aliases: [经营活动现金流出, 经营现金流出]
+        unit: 元
+        description: 经营活动现金流出总额。
+
+      - name: net_cash_flow_from_operating_activities
+        label_zh: 经营活动现金流量净额
+        aliases: [经营活动现金流净额, 经营现金流, 经营性现金流]
+        unit: 元
+        description: 经营活动现金净流入（正值表示经营造血）。用于计算自由现金流。
+
+      - name: cash_paid_for_long_term_assets
+        label_zh: 购建固定资产等支付的现金
+        aliases: [资本开支, 购建固定资产, capex]
+        unit: 元
+        description: 资本开支核心字段。用于计算自由现金流。
+
+      - name: net_cash_flow_from_investing_activities
+        label_zh: 投资活动现金流量净额
+        aliases: [投资活动现金流净额, 投资现金流]
+        unit: 元
+        description: 投资活动现金净流入/流出。
+
+      - name: net_cash_flow_from_financing_activities
+        label_zh: 筹资活动现金流量净额
+        aliases: [筹资活动现金流净额, 筹资现金流, 融资现金流]
+        unit: 元
+        description: 筹资活动现金净流入/流出。
+
+      - name: net_increase_in_cash_and_equivalents
+        label_zh: 现金及现金等价物净增加额
+        aliases: [现金净增加额]
+        unit: 元
+        description: 报告期现金净增加额。
+
+      - name: ending_cash_and_equivalents_balance
+        label_zh: 期末现金及现金等价物余额
+        aliases: [期末现金余额, 现金余额]
+        unit: 元
+        description: 报告期末现金余额。
+
+  # ------------------------------------------------------------------
+  #  dividend_history —— 分红送转历史
+  # ------------------------------------------------------------------
+  dividend_history:
+    name_zh: 分红送转历史
+    description: >
+      全量历史记录。每次分红/送转事件一行，覆盖 1990 年至今。
+      用于计算连续分红年数和每股税前股利。
+    primary_key: symbol + plan_notice_date
+    fields:
+      - name: symbol
+        label_zh: 股票代码
+        aliases: [股票代码]
+        unit: null
+        description: 6 位数字代码。
+
+      - name: name
+        label_zh: 股票简称
+        aliases: [股票简称, 名称]
+        unit: null
+        description: 证券简称。
+
+      - name: plan_profile
+        label_zh: 分配方案
+        aliases: [分配方案, 分红方案]
+        unit: null
+        description: 分红方案原文，如 "10 派 280.2423 元 (含税)"。
+
+      - name: pretax_bonus_per_share
+        label_zh: 税前每股股利
+        aliases: [税前每股股利, 每股派息, 每股股利, 每股分红, pretax_bonus]
+        unit: 元/股
+        description: 税前每股现金分红。系统取最新记录。
+
+      - name: bonus_share_ratio
+        label_zh: 送转股比例
+        aliases: [送转股比例, 送转比例]
+        unit: 股/10股
+        description: 每 10 股送转的股数。
+
+      - name: assign_progress
+        label_zh: 分配进度
+        aliases: [分配进度, 实施进度]
+        unit: null
+        description: 实施分配 / 预披露 / 董事会预案。
+
+      - name: plan_notice_date
+        label_zh: 预案公告日
+        aliases: [预案公告日, 公告日期]
+        unit: null
+        description: 分红预案公告日期，用于排序取最新分红。
+
+      - name: equity_record_date
+        label_zh: 股权登记日
+        aliases: [股权登记日]
+        unit: null
+        description: 股权登记日。
+
+      - name: ex_dividend_date
+        label_zh: 除权除息日
+        aliases: [除权除息日, 除息日]
+        unit: null
+        description: 除权除息日。
+
+      - name: implement_notice_date
+        label_zh: 实施公告日
+        aliases: [实施公告日]
+        unit: null
+        description: 分红实施公告日期。
+
+      - name: report_date
+        label_zh: 报告期
+        aliases: [报告期]
+        unit: null
+        description: 分红对应的财报报告期。
+
+
+# =============================================================================
+#  二、系统计算字段（由 factor_agent 自动计算，LLM 可直接引用）
+# =============================================================================
+
+computed_fields:
+  - name: pe_pb
+    label_zh: PE × PB
+    formula: pe_ttm * pb
+    depends_on: [pe_ttm, pb]
+    output_unit: 倍
+    aliases: [市盈率乘市净率, PE乘PB, 乘积, 之积]
+    description: 市盈率与市净率的乘积。
+
+  - name: earnings_yield
+    label_zh: 盈利收益率
+    formula: 1 / pe_ttm
+    depends_on: [pe_ttm]
+    output_unit: 比例
+    aliases: [盈利收益率]
+    description: 市盈率的倒数，反映每元股价对应的盈利能力。
+
+  - name: debt_to_equity
+    label_zh: 负债权益比
+    formula: total_liabilities / equity_attributable_to_parent
+    depends_on: [total_liabilities, equity_attributable_to_parent]
+    source_table: balance_sheet
+    output_unit: 倍
+    aliases: [负债权益比, 资产负债率, 负债率]
+    description: 总负债与归母净资产之比。金融企业不适用。
+
+  - name: current_ratio
+    label_zh: 流动比率
+    formula: total_current_assets / total_current_liabilities
+    depends_on: [total_current_assets, total_current_liabilities]
+    source_table: balance_sheet
+    output_unit: 倍
+    aliases: [流动比率, 流动比]
+    description: 流动资产除以流动负债，反映短期偿债能力。
+
+  - name: net_current_assets
+    label_zh: 流动资产净额
+    formula: total_current_assets - total_current_liabilities
+    depends_on: [total_current_assets, total_current_liabilities]
+    source_table: balance_sheet
+    output_unit: 元
+    aliases: [流动资产净额, 净流动资产, 营运资金]
+    description: 流动资产减流动负债之差，反映短期偿债缓冲。
+
+  - name: long_term_debt_to_net_ca_ratio
+    label_zh: 长期借款 / 流动资产净额
+    formula: long_term_borrowings / (total_current_assets - total_current_liabilities)
+    depends_on: [long_term_borrowings, total_current_assets, total_current_liabilities]
+    source_table: balance_sheet
+    output_unit: 倍
+    aliases: [长期债务不超过流动资产, 长期债务/流动资产净额]
+    description: 长期借款与营运资金之比。金融企业可能为 NULL。
+
+  - name: eps_growth_10yr_3yr_avg
+    label_zh: 过去 10 年 EPS 增长率
+    formula: (期末 3 年 EPS 均值 - 期初 3 年 EPS 均值) / |期初 3 年 EPS 均值|
+    depends_on: [eps_basic]
+    source_table: income_statement（需要 10 年历史数据）
+    output_unit: 小数（如 0.33 表示增长 33%）
+    aliases: [EPS增长, 每股收益增长, 10年EPS增长, eps_growth]
+    description: 期初和期末各取 3 年 EPS 均值计算增长率，平滑周期波动。
+
+  - name: consecutive_profitable_years
+    label_zh: 连续盈利年数
+    formula: 从最新年份回溯，每年 net_profit > 0 的连续年数
+    depends_on: [net_profit]
+    source_table: income_statement（全量历史）
+    output_unit: 年
+    aliases: [连续盈利, 每年都有利润, 持续盈利]
+    description: 从最新财年起往回数，净利润连续为正的年数。
+
+  - name: dividend_years_count
+    label_zh: 连续分红年数
+    formula: 从最新年份回溯有分红记录无间断的年数
+    depends_on: [pretax_bonus_per_share]
+    source_table: dividend_history（全量历史）
+    output_unit: 年
+    aliases: [连续分红, 持续分红, 连续支付股息, 分红年数]
+    description: 从最新年份往回数，每年都有分红记录的连续年数。
+
+  - name: pe_3yr_avg
+    label_zh: PE（3 年均）
+    formula: current_price / avg(最近 3 年 eps_basic)
+    depends_on: [current_price, eps_basic]
+    source_table: basic_info + income_statement（3 年历史）
+    output_unit: 倍
+    aliases: [3年平均PE, 过去3年平均利润的市盈率, pe_3yr]
+    description: 用最近 3 年 EPS 均值平滑周期后计算的市盈率。
+
+  - name: pretax_bonus_per_share
+    label_zh: 税前每股股利
+    formula: 取 dividend_history 表中最新 pretax_bonus_per_share
+    depends_on: [pretax_bonus_per_share]
+    source_table: dividend_history（最新记录）
+    output_unit: 元/股
+    aliases: [每股派息, 每股股利, 每股分红, 每股现金分红]
+    description: 最近一次分红的税前每股现金红利。
+
+
+# =============================================================================
+#  三、常用财务概念（中文名 → 公式 → 来源表和字段）
+# =============================================================================
+
+concepts:
+  - name: 资产负债率
+    english: debt_to_asset_ratio
+    description: 总负债占总资产的比例。
+    formula: total_liabilities / total_assets
+    source_table: balance_sheet
+    output_unit: 比例
+    aliases: [负债率, 杠杆率]
+
+  - name: 净利润率
+    english: net_profit_margin
+    description: 每元营业收入产生的净利润。
+    formula: net_profit / revenue
+    source_table: income_statement
+    output_unit: 比例
+    aliases: [净利率, 销售净利率]
+
+  - name: 毛利率
+    english: gross_profit_margin
+    description: 扣除营业成本后的利润占营收的比例。
+    formula: (revenue - operating_cost) / revenue
+    source_table: income_statement
+    output_unit: 比例
+    aliases: [毛利比]
+
+  - name: 营业利润率
+    english: operating_profit_margin
+    description: 主营业务的利润率。
+    formula: operating_profit / revenue
+    source_table: income_statement
+    output_unit: 比例
+    aliases: [经营利润率]
+
+  - name: 净资产收益率
+    english: roe
+    description: 股东资金的回报率。
+    formula: net_profit / equity_attributable_to_parent
+    source_table: income_statement + balance_sheet
+    output_unit: 比例
+    aliases: [ROE, 股东权益回报]
+
+  - name: 总资产收益率
+    english: roa
+    description: 每元资产产生的净利润。
+    formula: net_profit / total_assets
+    source_table: income_statement + balance_sheet
+    output_unit: 比例
+    aliases: [ROA, 资产回报率]
+
+  - name: 权益乘数
+    english: equity_multiplier
+    description: 总资产与净资产的倍数关系，反映财务杠杆。
+    formula: total_assets / equity_attributable_to_parent
+    source_table: balance_sheet
+    output_unit: 倍
+    aliases: [财务杠杆]
+
+  - name: 速动比率
+    english: quick_ratio
+    description: 更保守的短期偿债能力指标（剔除变现较慢的存货）。
+    formula: (total_current_assets - inventory) / total_current_liabilities
+    source_table: balance_sheet
+    output_unit: 倍
+    aliases: [酸性测试比率]
+
+  - name: 自由现金流
+    english: free_cash_flow
+    description: 经营活动产生的现金减去维持经营必需的资本开支。
+    formula: net_cash_flow_from_operating_activities - cash_paid_for_long_term_assets
+    source_table: cash_flow_statement
+    output_unit: 元
+    aliases: [FCF, 自由现金]
+
+  - name: 营收增长率
+    english: revenue_growth
+    description: 营收同比增幅。
+    formula: (当期 revenue - 上期 revenue) / |上期 revenue|
+    source_table: income_statement（需要历史数据）
+    output_unit: 比例
+    aliases: [收入增长, 成长率]
+
+  - name: 净利润增长率
+    english: net_profit_growth
+    description: 净利润同比增幅。
+    formula: (当期 net_profit - 上期 net_profit) / |上期 net_profit|
+    source_table: income_statement（需要历史数据）
+    output_unit: 比例
+    aliases: [利润增长]
+
+  - name: 每股自由现金流
+    english: fcf_per_share
+    description: 每股可自由支配现金。
+    formula: (经营活动现金流净额 - 资本开支) / 股本
+    source_table: cash_flow_statement + balance_sheet
+    output_unit: 元/股
+    aliases: [FCF每股]
+
+  - name: 应收账款周转率
+    english: receivables_turnover
+    description: 年营收与应收账款之比，反映应收账款的回收速度。
+    formula: revenue / accounts_receivable
+    source_table: income_statement + balance_sheet
+    output_unit: 次
+    aliases: [应收周转]
