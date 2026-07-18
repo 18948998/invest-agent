@@ -2,7 +2,7 @@
 
   1. **Tool 模式**（agent 显式调用，同步阻塞）：
      - refresh_basic_info()  —— 腾讯行情 → basic_info 表 → valid_codes.json
-     - refresh_financials()  —— valid_codes.json → 东方财富 → 三张财报表
+     - refresh_financials()  —— valid_codes.json → 东方财富 → 三张财报表（含分红送转，dividend.yaml 已纳入 financial track）
 
   2. **后台自动模式**（已有数据但过期，异步线程）：
      - ensure_data_fresh() —— 检查新鲜度 → 启动后台线程刷新
@@ -151,6 +151,7 @@ def refresh_basic_info(
             _refreshing.discard(track)
 
 
+
 def refresh_financials(
     db_path: str | Path,
     symbols: list[str] | None = None,
@@ -186,7 +187,7 @@ def refresh_financials(
             logger.info("无有效股票代码，生成全量 A 股代码 %d 只作为兜底", len(target_symbols))
 
         logger.info("tool: refresh_financials 开始（东方财富），%d 只...", len(target_symbols))
-        print(f"\n  [refresh_financials] 正在用东方财富拉取 {len(target_symbols)} 只财报...")
+        print(f"\n  [refresh_financials] 正在用东方财富拉取 {len(target_symbols)} 只财报+分红...")
 
         run_financial_ingest(
             symbols=target_symbols,
@@ -198,8 +199,11 @@ def refresh_financials(
         )
 
         record_update(db, "financial", len(target_symbols), "OK")
+        # dividend_history 已在 run_financial_ingest 中随财报一同拉取
+        # （dividend.yaml 的 statement_type=financial_statement，load_specs_by_track("financial") 会自动包含）
+        record_update(db, "dividend", len(target_symbols), "OK")
 
-        msg = f"财报刷新完成: {len(target_symbols)} 只"
+        msg = f"财报&分红刷新完成: {len(target_symbols)} 只"
         logger.info("tool: %s", msg)
         print(f"  [refresh_financials] {msg}")
         return {
@@ -228,6 +232,7 @@ def _bg_refresh_price(db_path: Path) -> None:
 def _bg_refresh_financial(db_path: Path) -> None:
     """后台线程入口，委托给同步 tool。"""
     refresh_financials(db_path)
+
 
 
 def ensure_data_fresh(db_path_str: str) -> DataFreshness:

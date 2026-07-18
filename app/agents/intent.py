@@ -93,6 +93,11 @@ _STRATEGY_KEY_MAP: dict[str, str] = {
     "价值投资": "graham",
     "深度价值": "graham",
     "低估值": "graham",
+    "防御": "defance-strategy",
+    "defance": "defance-strategy",
+    "防御型": "defance-strategy",
+    "defance-strategy": "defance-strategy",
+    "超低估": "超低估",
 }
 
 
@@ -101,13 +106,29 @@ def _extract_strategy_name(text: str) -> str:
 
     查找顺序：
       1. 硬编码关键词映射（预设策略，毫秒级）
-      2. 策略注册表（用户自定义策略，按中文名匹配）
+      2. "策略N" 编号匹配 → 按注册表索引查找
+      3. 策略注册表（用户自定义策略，按中文名匹配）
     """
     t = text.lower()
     # ---- 1. 预设关键词 ----
     for keyword, key in _STRATEGY_KEY_MAP.items():
         if keyword.lower() in t:
             return key
+
+    # ---- 1.5. "策略N" / "第N个策略" 编号匹配 ----
+    import re
+    num_match = re.search(r'(?:第\s*)?策略\s*(\d+)', text)
+    if num_match:
+        try:
+            n = int(num_match.group(1))
+            from app.memory.strategy_memory import list_strategies
+            info = list_strategies()
+            strategies = info.get("strategies", {})
+            keys = list(strategies.keys())
+            if 1 <= n <= len(keys):
+                return keys[n - 1]
+        except Exception:
+            pass
 
     # ---- 2. 用户自定义策略（按中文名遍历注册表） ----
     try:
@@ -211,23 +232,67 @@ def classify_with_llm(text: str, llm=None) -> Classification:
     if llm is None:
         return classify(text)
 
+    # 动态从注册表获取策略列表
+    strategies_desc = ""
+    try:
+        from app.memory.strategy_memory import list_strategies
+        info = list_strategies()
+        strategies = info.get("strategies", {})
+        if strategies:
+            lines = []
+            for i, (key, entry) in enumerate(strategies.items(), 1):
+                name = entry.get("name", key)
+                desc = (entry.get("description", "") or "")[:80]
+                lines.append(f"  {i}. {name}（key: {key}）: {desc}")
+            strategies_desc = "\n".join(lines)
+    except Exception:
+        pass
+
+    if not strategies_desc:
+        strategies_desc = "- graham / 格雷厄姆 / 价值投资 / 深度价值 / 低估值"
+
     prompt = f"""你是一个投资助手意图分类器。分析用户输入，判断其意图。
 
 意图类型及示例：
-- screen: "帮我找市盈率低于15的股票"、"筛选格雷厄姆标的"、"推荐价值股"
+- screen: "帮我找市盈率低于15的股票"、"筛选格雷厄姆标的"、"推荐价值股"、"根据策略3筛选股票"、"按defance-strategy筛选"
 - screen_save: "记住pe<10 pb<0.8为超低估策略"、"保存这个策略叫低估值"、"起个名字叫小盘价值"
 - analyze: "分析一下600519"、"茅台的基本面怎么样"、"看看000001"
 - help: "你能做什么"、"帮助"、"怎么用"
 - quit: "退出"、"再见"
 - unknown: 无法识别
 
-策略名称（仅在 intent 为 screen 时提取，否则留空）：
-- graham / 格雷厄姆 / 价值投资 / 深度价值 / 低估值
+可用策略名称（仅在 intent 为 screen/screen_save 时提取对应的 key，否则留空）：
+{strategies_desc}
+
+重要：如果用户说"策略N"（如"策略3"），请查找上面列表中编号为N的策略，提取其 key 填入 strategy_name。
 
 用户输入: {text}
 
 请严格按以下 JSON 格式输出（不要输出任何其他内容）：
-{{"intent": "<intent>", "confidence": <0.0-1.0>, "symbol": "<提取到的6位数字股票代码，没有则为空>", "strategy_name": "<策略英文key，如 graham，没有则为空>"}}"""
+{{"intent": "<intent>", "confidence": <0.0-1.0>, "symbol": "<提取到的6位数字股票代码，没有则为空>", "strategy_name": "<策略英文 key，如 graham 或 defance-strategy，没有则为空>"}}"""
+
+    try:
+        response = llm.invoke(prompt)
+        import json
+        content = response.content if hasattr(response, "content") else str(response)
+        data = json.loads(content)
+        intent_str = data.get("intent", "unknown")
+        intent_map = {
+            "screen": Intent.SCREEN,
+            "screen_save": Intent.SCREEN_SAVE,
+            "analyze": Intent.ANALYZE,
+            "help": Intent.HELP,
+            "quit": Intent.QUIT,
+        }
+        return Classification(
+            intent=intent_map.get(intent_str, Intent.UNKNOWN),
+            confidence=float(data.get("confidence", 0.5)),
+            extracted_symbol=data.get("symbol", ""),
+            strategy_name=data.get("strategy_name", ""),
+            reason=f"LLM 分类: {intent_str}",
+        )
+    except Exception:
+        return classify(text)  # 降级
 
     try:
         response = llm.invoke(prompt)

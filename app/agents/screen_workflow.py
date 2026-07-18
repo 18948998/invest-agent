@@ -19,8 +19,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from app.agents.sub_agents.data_agent import load_basic_info, check_freshness, FreshnessStatus, load_latest_financial
-from app.agents.sub_agents.factor_agent import FactorResult, compute_factors, compute_factors_with_financials
+from app.agents.sub_agents.data_agent import load_basic_info, check_freshness, FreshnessStatus, load_latest_financial, load_dividend_history, load_income_statement_history
+from app.agents.sub_agents.factor_agent import FactorResult, compute_factors, compute_factors_with_financials, enrich_with_historical_factors
 from app.agents.sub_agents.rule_agent import RuleResult, apply_rules
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,8 @@ def parse_screen_conditions(text: str) -> dict[str, Any]:
 - pb: 市净率（倍）
 - roe: 净资产收益率（%，如 15 表示 15%）
 - dividend_yield: 股息率（%，如 3 表示 3%）
+- pretax_bonus_per_share: 税前每股股利（元/股，来自分红送转历史表最新记录）
+- dividend_years_count: 连续分红年数（年，如"连续20年分红"→ {{"dividend_years_count": {{"min": 20}}}}）
 - market_cap: 总市值（自动换算：1亿=1e8，如 "50亿" → 5000000000）
 - eps_basic: 每股基本收益
 - debt_to_equity: 负债权益比
@@ -149,17 +151,27 @@ def _parse_conditions_fallback(text: str) -> dict[str, Any]:
         "pb": ["pb", "市净率"],
         "roe": ["roe", "净资产收益率"],
         "dividend_yield": ["dividend_yield", "股息率", "分红率"],
+        "pretax_bonus_per_share": ["pretax_bonus_per_share", "每股派息", "每股股利", "分红", "dividend"],
+        "dividend_years_count": ["dividend_years_count", "连续分红年数", "连续分红", "持续分红", "连续支付股息", "分红年数"],
         "market_cap": ["market_cap", "市值"],
         "eps_basic": ["eps_basic", "每股收益", "eps"],
         "debt_to_equity": ["debt_to_equity", "负债权益比", "资产负债率"],
         "current_ratio": ["current_ratio", "流动比率"],
+        "long_term_borrowings": ["long_term_borrowings", "长期债务", "长期借款"],
+        "net_current_assets": ["net_current_assets", "流动资产净额", "净流动资产"],
+        "long_term_debt_to_net_ca_ratio": ["long_term_debt_to_net_ca_ratio", "长期债务/流动资产净额"],
     }
 
     # 匹配: 字段名 + 比较符号 + 数值（可选 % 或 亿）
     _cond_pattern = re.compile(
         r"(市盈率|pe_ttm|pe|市净率|pb|净资产收益率|roe|股息率|分红率|dividend_yield"
+        r"|每股派息|每股股利|分红|派息|pretax_bonus_per_share"
+        r"|连续分红|持续分红|dividend_years_count"
         r"|市值|market_cap|每股收益|eps_basic|eps|负债权益比|资产负债率|debt_to_equity"
-        r"|流动比率|current_ratio)"
+        r"|流动比率|current_ratio"
+        r"|长期债务|长期借款|long_term_borrowings"
+        r"|流动资产净额|净流动资产|net_current_assets"
+        r"|long_term_debt_to_net_ca_ratio)"
         r"\s*"
         r"(<|>|<=|>=|=|小于|大于|低于|高于|不超过|不小于)"
         r"\s*"
@@ -216,8 +228,8 @@ def _parse_conditions_fallback(text: str) -> dict[str, Any]:
 def _parse_strategy_description_fallback(description: str) -> dict[str, Any]:
     """LLM 不可用时的确定性降级：用别名表 + 正则从策略描述中提取结构化条件。
 
-    逐条拆分描述中的规则，用别名表匹配字段，提取数值和比较符。
-    别名表覆盖不到的规则放入 unsupported。
+    逐条拆分描述中的规则，先匹配特殊规则（EPS增长、分红年数、二分一、每年利润等），
+    再用别名表覆盖剩余规则。
     """
     import re
 
@@ -228,7 +240,6 @@ def _parse_strategy_description_fallback(description: str) -> dict[str, Any]:
     for alias, field in FIELD_ALIASES_ZH.items():
         _alias_map.setdefault(field, set()).add(alias)
 
-    # 需要排除的通用词（避免误匹配）—— 仅排除太短的通用词
     _exclude = {
         "eps", "dividend",
         "负债", "长期债务", "每股收益",
@@ -242,21 +253,157 @@ def _parse_strategy_description_fallback(description: str) -> dict[str, Any]:
     rules = re.split(r'\n\s*\d+[\.、．)\s]+', desc_clean)
     rules = [r.strip() for r in rules if len(r.strip()) > 10]
 
-    # 计算字段优先（如 pe_pb 比 pe_ttm 先匹配），行内按分号拆分
-    _computed_fields = {"pe_pb"}
+    # ── 特殊规则（先检查）：中文分数、"每年都有利润"、"至少N年分红"等 ──
+    _CHINESE_FRACTIONS = {"三分之一": 1/3, "三分之二": 2/3, "一半": 0.5, "四分之一": 0.25,
+                          "一倍": 1, "两倍": 2, "三倍": 3, "五倍": 5, "十倍": 10}
+
+    # 计算字段优先
+    _computed_fields = {"pe_pb", "eps_growth_10yr_3yr_avg", "consecutive_profitable_years"}
     _field_order = list(_computed_fields) + [f for f in _alias_map if f not in _computed_fields]
 
     for rule_raw in rules:
-        # 一行可能有多个条件（用分号/句号分隔）
-        sub_rules = re.split(r'[；;。]', rule_raw) if len(rule_raw) > 30 else [rule_raw]
+        sub_rules = re.split(r'[；;。]', rule_raw) if len(rule_raw) > 40 else [rule_raw]
         sub_rules = [s.strip() for s in sub_rules if len(s.strip()) > 10]
 
         for rule in sub_rules:
             matched = False
 
+            # ── 特殊匹配：EPS 增长率 ──
+            if re.search(r'(每股收益|eps|每股利润).*(增长|上涨|增加|至少要|不低于)', rule, re.I):
+                for word, num in _CHINESE_FRACTIONS.items():
+                    if word in rule:
+                        filters.setdefault("eps_growth_10yr_3yr_avg", {})["min"] = round(num, 4)
+                        matched = True
+                        break
+                if matched:
+                    continue
+                # 尝试匹配数字
+                m = re.search(r'(增长|上涨).*?(\d+\.?\d*)\s*(%|倍|分之一)?', rule)
+                if m:
+                    val = float(m.group(2))
+                    if m.group(3) in ('分之一',): val = 1/val
+                    filters.setdefault("eps_growth_10yr_3yr_avg", {})["min"] = val
+                    matched = True
+                    continue
+
+            # ── 特殊匹配：连续分红年数 ──
+            m = re.search(r'(至少有|至少|不低于|不小于?)\s*(\d+)\s*年\s*(连续|持续).*(分红|支付股息|股息|派息|股利)', rule)
+            if m:
+                filters.setdefault("dividend_years_count", {})["min"] = float(m.group(2))
+                matched = True
+                continue
+
+            # ── 特殊匹配：每年都有利润 → 连续盈利年数 ──
+            if re.search(r'(每年|每一年).*(利润|盈利|有利润|有盈利)', rule):
+                m = re.search(r'(过去\s*)?(\d+)\s*年', rule)
+                yr = int(m.group(2)) if m else 10
+                filters.setdefault("consecutive_profitable_years", {})["min"] = float(yr)
+                matched = True
+                continue
+
+            # ── 特殊匹配：过去3年平均利润的市盈率 / 股价不应高于过去3年平均利润的X倍 ──
+            if re.search(r'(过去\s*)?3\s*年\s*平均\s*(利润|收益|EPS|eps)', rule) or re.search(r'(三年平均|近3年).*(利润|收益)', rule):
+                m = re.search(r'(\d+\.?\d*)\s*(倍|_)', rule)
+                if m:
+                    val = float(m.group(1))
+                    filters.setdefault("pe_3yr_avg", {})["max"] = val
+                    matched = True
+                    continue
+                # 尝试匹配"15倍"这样的数字
+                for word, num in _CHINESE_FRACTIONS.items():
+                    if word in rule:
+                        filters.setdefault("pe_3yr_avg", {})["max"] = float(num * 15) if num == 3 else float(num * 15)
+                        matched = True
+                        break
+                if matched:
+                    continue
+                # 兜底：尝试任何数字
+                m = re.search(r'(\d+)\s*倍', rule)
+                if m:
+                    filters.setdefault("pe_3yr_avg", {})["max"] = float(m.group(1))
+                    matched = True
+                    continue
+
+            # ── 特殊匹配：流动资产 ≥ 2× 流动负债 ──
+            if re.search(r'流动资产.*流动负债.*(两倍|2倍|二倍)', rule):
+                filters.setdefault("current_ratio", {})["min"] = 2.0
+                matched = True
+                continue
+
+            # ── 特殊匹配：负债 ≤ 2× 股权 ──
+            if re.search(r'负债.*股权.*(两倍|2倍|二倍)', rule):
+                filters.setdefault("debt_to_equity", {})["max"] = 2.0
+                matched = True
+                continue
+
+            # ── 特殊匹配：长期债务不应超过流动资产净额 → long_term_debt_to_net_ca_ratio ≤ 1 ──
+            if re.search(r'长期债务.*不超过.*流动资产净额', rule):
+                filters.setdefault("long_term_debt_to_net_ca_ratio", {})["max"] = 1.0
+                matched = True
+                continue
+
+            # ── 特殊匹配：行业差异化条件（工业企业…公用事业企业…），取最严格（全部 AND）──
+            if re.search(r'(工业企业|公用事业)', rule):
+                # 销售额
+                for unit, mul in [("亿美元", 7*1e8), ("亿", 1e8), ("万", 1e4)]:
+                    m = re.search(r'销售额\s*(不低于|不小于|至少|大于|高于|超过)?\s*(\d+\.?\d*)\s*' + unit, rule)
+                    if m:
+                        val = float(m.group(2)) * mul
+                        filters.setdefault("revenue", {})["min"] = val
+                        matched = True
+                        break
+                # 总资产
+                for unit, mul in [("亿美元", 7*1e8), ("亿", 1e8), ("万", 1e4)]:
+                    m = re.search(r'总资产\s*(不低于|不小于|至少|大于|高于|超过)?\s*(\d+\.?\d*)\s*' + unit, rule)
+                    if m:
+                        val = float(m.group(2)) * mul
+                        filters.setdefault("total_assets", {})["min"] = val
+                        matched = True
+                        break
+                # 流动比率
+                for word, num in [("两倍", 2), ("2倍", 2), ("二倍", 2)]:
+                    if word in rule and re.search(r'流动资产.*流动负债', rule):
+                        filters.setdefault("current_ratio", {})["min"] = float(num)
+                        matched = True
+                        break
+                # 负债 ≤ N× 股权
+                m = re.search(r'负债.*(?:不应|不该|不).*(?:超过|高于)\s*(?:股权|权益|净资产)\s*(两倍|2倍|二倍)', rule)
+                if m:
+                    filters.setdefault("debt_to_equity", {})["max"] = 2.0
+                    matched = True
+                if matched:
+                    continue
+
+            # ── 特殊匹配：非ST、退市股 → 已通过 universe.exclude_st 支持 ──
+            if re.search(r'(非\s*ST|退市|ST\s*股)', rule):
+                matched = True
+                continue
+
+            # ── 特殊匹配：年销售额不低于 X 亿 ──
+            for unit, mul in [("亿美元", 7*1e8), ("亿", 1e8), ("万", 1e4)]:
+                m = re.search(r'销售额\s*(不低于|不小于|至少|大于|高于|超过)?\s*(\d+\.?\d*)\s*' + unit, rule)
+                if m:
+                    val = float(m.group(2)) * mul
+                    filters.setdefault("revenue", {})["min"] = val
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            # ── 特殊匹配：总资产不低于 X 亿 ──
+            for unit, mul in [("亿美元", 7*1e8), ("亿", 1e8), ("万", 1e4)]:
+                m = re.search(r'总资产\s*(不低于|不小于|至少|大于|高于|超过)?\s*(\d+\.?\d*)\s*' + unit, rule)
+                if m:
+                    val = float(m.group(2)) * mul
+                    filters.setdefault("total_assets", {})["min"] = val
+                    matched = True
+                    break
+            if matched:
+                continue
+
+            # ── 通用别名匹配 ──
             for field in _field_order:
                 aliases = _alias_map[field]
-                # 排除通用短词防止误匹配
                 effective_aliases = [a for a in aliases if a not in _exclude or len(a) >= 4]
                 for alias in sorted(effective_aliases, key=len, reverse=True):
                     if alias not in rule and alias.lower() not in rule.lower():
@@ -282,47 +429,37 @@ def _parse_strategy_description_fallback(description: str) -> dict[str, Any]:
                             continue
 
                         val = float(val_str)
-
                         has_usd = '美元' in rule
                         if has_usd:
-                            if '亿' in rule:
-                                val *= 1e8
+                            if '亿' in rule: val *= 1e8
                             val *= 7
-                        elif unit == '亿':
-                            val *= 1e8
-                        elif unit == '万':
-                            val *= 1e4
+                        elif unit == '亿': val *= 1e8
+                        elif unit == '万': val *= 1e4
 
                         entry = filters.setdefault(field, {})
-
                         if op_word in ('不低于', '不小于', '至少', '大于', '高于'):
                             entry["min"] = val
                         elif op_word in ('不应该超过', '不应超过', '不超过', '不应高于', '小于', '低于', '不大于'):
                             entry["max"] = val
                         elif op_word is None:
-                            if '不低于' in rule or '至少' in rule:
-                                entry["min"] = val
-                            elif '不超过' in rule or '低于' in rule or '小于' in rule:
-                                entry["max"] = val
-                            else:
-                                entry["max"] = val  # "的15倍"→默认上限
+                            if '不低于' in rule or '至少' in rule: entry["min"] = val
+                            elif '不超过' in rule or '低于' in rule or '小于' in rule: entry["max"] = val
+                            else: entry["max"] = val
 
                         matched = True
                         break
-
-                    if matched:
-                        break
-
-                if matched:
-                    break
+                    if matched: break
+                if matched: break
 
             if not matched:
+                # 跳过策略标题、非条件描述等
+                if not re.search(r'(不大于|不小于|至少|不低于|不应|不超过|大于|低于|小于|高于|连续|每年|至少|不超)', rule):
+                    continue
                 unsupported.append(f"「{rule[:60]}…」")
 
     # pe_ttm > 0 的特殊处理
     if "pe_ttm" in filters and "min" not in filters["pe_ttm"]:
         filters["pe_ttm"]["min"] = 0
-        # 如果有 max=15 但没 min，补 min=0
         if "max" in filters["pe_ttm"] and filters["pe_ttm"]["max"] > 0:
             filters["pe_ttm"]["min"] = 0
 
@@ -389,17 +526,30 @@ def translate_description(description: str, safety_filters: dict[str, Any] | Non
         ("pe_ttm",  "滚动市盈率（倍），中文别名：市盈率/PE"),
         ("pb",      "市净率（倍），中文别名：市净率/账面值/价格账面值比"),
         ("roe",     "净资产收益率（%），中文别名：净资产收益率/ROE"),
-        ("dividend_yield", "股息率（%），中文别名：股息率/分红率"),
+        ("dividend_yield", "股息率（%），中文别名：股息率/分红率。注意：系统仅取最新年报数据"),
+        ("pretax_bonus_per_share", "税前每股股利（元/股），中文别名：每股派息/每股股利/每股分红。来自分红送转历史表最新记录"),
+        ("dividend_years_count", "连续分红年数（年），中文别名：连续分红年数/持续分红年数/连续支付股息年数/分红年数。指从最新年份向前回溯无间断的年份数，如'至少20年连续支付股息(分红)'→{{'dividend_years_count': {{'min': 20}}}}"),
         ("market_cap",     "总市值（元），1亿=1e8，别名：市值/总市值。注意：销售额/营收不是市值"),
-        ("eps_basic",      "基本每股收益（元），中文别名：每股收益/EPS"),
-        ("debt_to_equity", "负债权益比（倍），中文别名：负债权益比/资产负债率/负债"),
-        ("current_ratio",  "流动比率（倍），中文别名：流动比率/流动比/流动资产"),
-        ("revenue",        "营业收入（元），来自利润表，别名：销售额/年销售额/营收。'年销售额不低于60亿美元'→先用汇率换算为元，再映射到此字段"),
-        ("total_assets",   "总资产（元），来自资产负债表，别名：总资产/资产总额。'总资产不低于30亿人民币'→映射到此字段"),
+        ("eps_basic",      "基本每股收益（元），中文别名：每股收益/EPS。系统仅取最新年报数据"),
+        ("debt_to_equity", "负债权益比（倍），中文别名：负债权益比/资产负债率/负债。系统仅取最新年报数据"),
+        ("current_ratio",  "流动比率（倍），中文别名：流动比率/流动比/流动资产。系统仅取最新年报数据"),
+        ("revenue",        "营业收入（元），来自利润表（最新年报），别名：销售额/年销售额/营收。'年销售额不低于60亿美元'→先用汇率换算为元，再映射到此字段"),
+        ("total_assets",   "总资产（元），来自资产负债表（最新年报），别名：总资产/资产总额。'总资产不低于30亿人民币'→映射到此字段"),
+        ("eps_growth_10yr_3yr_avg", "过去10年EPS增长率（小数，如0.33表示增长33%），别名：过去10年每股收益增长/EPS增长/每股收益增长。系统已支持：用合并三年平均值对比期初和期末。如'过去10年每股收益的增长至少要达到三分之一'→{{'eps_growth_10yr_3yr_avg': {{'min': 0.333}}}}"),
+        ("consecutive_profitable_years", "连续盈利年数（年），别名：连续盈利/每年都有利润/持续盈利。系统已支持：从利润表每年净利润>0计算。如'过去10年中普通股每年都有一定的利润'→{{'consecutive_profitable_years': {{'min': 10}}}}"),
+        ("pe_3yr_avg", "PE(3年均)（倍）= 当前股价 ÷ 最近3年EPS均值。别名：过去3年平均利润的市盈率/3年平均利润估值/过去3年平均利润。系统已支持：自动取最近3年EPS均值计算。如'股价不应高于过去3年平均利润的15倍'→{{'pe_3yr_avg': {{'max': 15}}}}"),
+        ("long_term_borrowings", "长期借款/长期债务（元），来自资产负债表（最新年报），别名：长期债务/长期借款。系统仅取最新年报数据"),
+        ("net_current_assets", "流动资产净额（元）= total_current_assets - total_current_liabilities，别名：流动资产净额/净流动资产。这是计算字段，系统自动从资产负债表计算"),
+        ("long_term_debt_to_net_ca_ratio", "长期债务/流动资产净额（倍）= long_term_borrowings ÷ net_current_assets，别名：长期债务不超过流动资产净额。如'长期债务不应超过流动资产净额'→{{'long_term_debt_to_net_ca_ratio': {{'max': 1}}}}"),
     ]
 
     _computed_fields = [
         ("pe_pb", "PE×PB乘积 = pe_ttm × pb，中文别名：市盈率×市净率/市盈率与价格账面值之比的乘积/市盈率乘市净率"),
+        ("dividend_years_count", "见基础字段说明（系统自动从分红送转历史表计算）"),
+        ("eps_growth_10yr_3yr_avg", "见基础字段说明（系统自动从利润表10年历史计算）"),
+        ("consecutive_profitable_years", "见基础字段说明（系统自动从利润表历史数据计算）"),
+        ("net_current_assets", "流动资产净额 = total_current_assets - total_current_liabilities（系统自动计算）"),
+        ("long_term_debt_to_net_ca_ratio", "长期债务/流动资产净额 = long_term_borrowings ÷ net_current_assets（系统自动计算）"),
     ]
 
     base_lines = "\n".join(f"- {k}: {desc}" for k, desc in _base_fields)
@@ -416,6 +566,11 @@ def translate_description(description: str, safety_filters: dict[str, Any] | Non
 {computed_lines}
 
 ## 核心规则（必须严格遵守）
+
+### 0. 数据来源说明
+- 所有财报字段（revenue、total_assets、debt_to_equity、current_ratio、eps_basic、roe 等）系统**仅提供最新年报数据**。
+- 分红字段 pretax_bonus_per_share 来自分红送转历史表的最新记录（每股税前股利）。
+- 分红字段 dividend_years_count 是系统自动计算的**连续分红年数**（从最新年份往前回溯，无间断的年份数）。如"至少20年连续支付股息"→ {{"dividend_years_count": {{"min": 20}}}}。
 
 ### 1. 反幻觉
 - 策略描述中**没有提到的字段，一律不要凭空添加**到 filters 中。
@@ -436,15 +591,32 @@ def translate_description(description: str, safety_filters: dict[str, Any] | Non
 
 ### 4. 不支持的情况要明确说明
 以下情况应放入 unsupported：
-- 需要历史数据（如"过去10年EPS增长"、"连续20年分红"、"过去10年每年有利润"）
-- 系统没有对应字段（如"总资产"——在资产负债表、不在basic_info；"年销售额"——在利润表、不是市值）
-- 跨多字段的复杂比较（如"负债≤股权×2"，这需要同时查两个字段做除法判分，当前单字段 min/max 无法表达）
-- 单个字段 min/max 无法表达的条件（如"流动资产至少是流动负债的两倍"= current_ratio≥2，这是可以的）
+- 系统没有对应字段且无法用现有计算字段表达的条件
+- 例如"管理层持股比例"、"员工人数"等非财务条件
 
-注意：部分条件虽然涉及多字段，但可以化简为单字段约束：
-  - "流动资产至少是流动负债的两倍" → {{"current_ratio": {{"min": 2}}}}（流动比率本身就是流动资产/流动负债）
+注意以下条件系统已支持：
+  - "长期债务不应超过流动资产净额" → {{"long_term_debt_to_net_ca_ratio": {{"max": 1}}}}（系统自动计算比率）
+  - "流动资产至少是流动负债的两倍" → {{"current_ratio": {{"min": 2}}}}（current_ratio已支持）
 
-### 5. 条件输出格式
+### 5. 行业差异化规则处理
+**核心原则：系统没有行业分类字段，遇到"工业企业…公用事业企业…"等分行业的条件，取最严格（所有分支条件都加 AND）。**
+- 例如"工业企业年销售额不低于60亿；公用事业企业总资产不低于30亿" → 同时加入 revenue min=60亿 和 total_assets min=30亿
+- 例如"工业企业流动比率≥2；公用事业企业负债≤2×股权" → 同时加入 current_ratio min=2 和 debt_to_equity max=2
+- 例如"非ST、退市股" → 系统已通过 universe.exclude_st 自动排除ST/PT/退市股，无需输出到 filters 或 unsupported
+
+注意：以下历史数据相关条件系统已支持：
+  - "至少N年连续分红"/"连续N年支付股息"/"至少有N年连续分红记录" → {{"dividend_years_count": {{"min": N}}}}
+  - "过去10年EPS增长至少达到三分之一" / "过去10年内每股收益的增长至少要达到三分之一(期初和期末使用三年平均数)" → {{"eps_growth_10yr_3yr_avg": {{"min": 0.333}}}}
+  - "过去10年中每年都有利润" / "过去10年中普通股每年都有一定的利润" → {{"consecutive_profitable_years": {{"min": 10}}}}
+  - "股价不应高于过去3年平均利润的15倍" / "过去3年平均利润的X倍" → {{"pe_3yr_avg": {{"max": X}}}}
+  - dividend_years_count 是系统自动从分红送转历史表计算的连续分红年数（从最新年份回溯无间断）
+  - eps_growth_10yr_3yr_avg 是系统自动从利润表10年历史计算的EPS增长率（期初3年均值vs期末3年均值）
+  - consecutive_profitable_years 是系统自动从利润表历史数据计算的连续盈利年数
+  - pe_3yr_avg 是系统自动计算的PE(3年均)，用最近3年EPS均值
+  - "每股派息"/"每股股利"/"每股分红" → pretax_bonus_per_share（最新记录）
+  - "长期债务不应超过流动资产净额" → {{"long_term_debt_to_net_ca_ratio": {{"max": 1}}}}（系统自动计算 long_term_borrowings ÷ (current_assets - current_liabilities)）
+
+### 6. 条件输出格式
 每个字段最多两个约束：min（下限）和 max（上限）。
 - "pe_ttm 小于 15" → {{"pe_ttm": {{"max": 15}}}}
 - "roe 大于 10%" → {{"roe": {{"min": 10}}}}
@@ -479,7 +651,20 @@ def translate_description(description: str, safety_filters: dict[str, Any] | Non
 
     try:
         import json
-        response = llm.invoke(prompt)
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+        def _call_llm():
+            return llm.invoke(prompt)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call_llm)
+            try:
+                response = future.result(timeout=120)  # 最多等 2 分钟
+            except FutureTimeoutError:
+                print(f"  ⚠ LLM 调用超时（>120s），自动降级为规则解析器...")
+                logger.warning("LLM 翻译策略描述超时（>120s），降级为规则解析")
+                raise TimeoutError("LLM call timed out after 120s")
+
         content = response.content if hasattr(response, "content") else str(response)
         content = content.strip()
         if content.startswith("```"):
@@ -509,9 +694,33 @@ def translate_description(description: str, safety_filters: dict[str, Any] | Non
         logger.info("策略描述翻译完成: filters=%s, unsupported=%s", effective, unsupported)
         return {"filters": effective, "unsupported": unsupported}
 
-    except Exception as e:
-        logger.warning("LLM 翻译策略描述失败: %s", e)
-        return {"filters": {}, "unsupported": [f"翻译失败: {e}"]}
+    except (TimeoutError, Exception) as e:
+        print(f"  ⚠ LLM 翻译超时/失败，降级为规则解析器，原因: {e}")
+        logger.warning("LLM 翻译策略描述失败，降级为规则解析: %s", e)
+        # 超时或其他异常时，使用规则解析器兜底
+        result = _parse_strategy_description_fallback(description)
+        effective, hallucinated = _drop_hallucinated_fields(result.get("filters", {}), description)
+        if hallucinated:
+            result["unsupported"] = list(result.get("unsupported", [])) + hallucinated
+        result["filters"] = _normalize_filters(effective)
+        print(f"  ┌─ 降级解析结果（规则解析器）─────────────")
+        print(f"  │ 已翻译条件（{len(result['filters'])} 条）：")
+        for i, (field, cond) in enumerate(result["filters"].items(), 1):
+            label = _FIELD_LABEL.get(field, field)
+            constraints: list[str] = []
+            if "min" in cond:
+                constraints.append(str(cond["min"]))
+            constraints.append("~")
+            if "max" in cond:
+                constraints.append(str(cond["max"]))
+            print(f"  │   {i}. {label}  {''.join(constraints)}")
+        if result.get("unsupported"):
+            print(f"  │")
+            print(f"  │ 不支持条件（{len(result['unsupported'])} 条）：")
+            for i, u in enumerate(result["unsupported"], 1):
+                print(f"  │   {i}. {u}")
+        print(f"  └───────────────────────────────────────────")
+        return result
 
 
 def _to_num(v: Any) -> float | None:
@@ -605,14 +814,22 @@ def _drop_hallucinated_fields(
         "pb":             [r"市净率", r"账面值", r"价格账面", r"市账", r"\bPB\b", r"资产净值"],
         "roe":            [r"净资产收益", r"净资产回报", r"\bROE\b", r"资本回报率", r"股东权益回报"],
         "dividend_yield": [r"股息率", r"分红率", r"派息率", r"dividend.yield", r"现金分红"],
+        "pretax_bonus_per_share": [r"每股派息", r"每股股利", r"每股分红", r"税前每股", r"pretax.bonus", r"每股现金分红"],
+        "dividend_years_count": [r"连续分红", r"持续分红", r"连续.*年.*分红", r"连续支付股息", r"分红年数", r"dividend.years"],
         "market_cap":     [r"市值", r"总市值", r"\bmarket.cap\b"],
         "revenue":        [r"营业收入", r"销售额", r"营收", r"年销售额", r"\brevenue\b", r"销售收入"],
         "total_assets":   [r"总资产", r"资产总额", r"total.assets", r"资产(?!负债)"],
         "eps_basic":      [r"每股收?益", r"\bEPS\b", r"每股利润", r"每股盈利"],
-        "debt_to_equity": [r"负债.*权益", r"负债.*股权", r"资产负债", r"debt.*equity", r"长期债务"],
+        "eps_growth_10yr_3yr_avg": [r"EPS增长", r"每股收益.*增长", r"每股利润.*增长", r"支付股息.*记录", r"三年平均"],
+        "consecutive_profitable_years": [r"每年.*利润", r"连续盈利", r"每年.*盈利", r"普通股每年"],
+        "pe_3yr_avg": [r"3.*年平均.*利润", r"三年平均.*利润", r"过去.*3.*年.*平均.*利润", r"最近3年.*EPS均值", r"3年.*平均.*PE"],
+        "debt_to_equity": [r"负债.*权益", r"负债.*股权", r"资产负债", r"debt.*equity"],
         "current_ratio":  [r"流动比", r"流动资产.*流动负债", r"流动负债.*流动资产", r"current.ratio"],
         "pe_pb":          [r"市盈率.*市净率|市盈率.*账面值|市净率.*市盈率|账面值.*市盈率",
                            r"市盈率.*乘|市盈率.*积|乘积|之积"],
+        "long_term_borrowings": [r"长期债务", r"长期借款", r"长期负债", r"long.term.borrow"],
+        "net_current_assets": [r"流动资产净额", r"净流动资产", r"net.current.asset"],
+        "long_term_debt_to_net_ca_ratio": [r"长期债务.*流动资产净额", r"长期债务.*不超过.*流动资产"],
     }
 
     desc_lower = description.lower()
@@ -726,12 +943,53 @@ def extracted_to_strategy_config(
     }
 
 
+# monetary fields that should display as 亿 unit
+_MONETARY_FIELDS = {"market_cap", "revenue", "total_assets", "long_term_borrowings", "net_current_assets"}
+
+# percentage fields (already in %, just show as-is)
+_PCT_FIELDS = {"roe", "dividend_yield", "dividend_payout_ratio"}
+
+
+def _resolve_field_value(factors: dict[str, Any], field: str) -> float | None:
+    """Resolve a field's value from factors dict, including computed fields."""
+    if field == "pe_pb":
+        pe = _to_num(factors.get("pe_ttm"))
+        pb = _to_num(factors.get("pb"))
+        return pe * pb if pe is not None and pb is not None else None
+    if field == "net_current_assets":
+        tca = _to_num(factors.get("total_current_assets"))
+        tcl = _to_num(factors.get("total_current_liabilities"))
+        return tca - tcl if tca is not None and tcl is not None else None
+    if field == "long_term_debt_to_net_ca_ratio":
+        ltb = _to_num(factors.get("long_term_borrowings"))
+        nca = _to_num(factors.get("net_current_assets"))
+        if ltb is not None and nca is not None and nca > 0:
+            return ltb / nca
+        tca = _to_num(factors.get("total_current_assets"))
+        tcl = _to_num(factors.get("total_current_liabilities"))
+        if ltb is not None and tca is not None and tcl is not None:
+            nca2 = tca - tcl
+            if nca2 > 0:
+                return ltb / nca2
+        return None
+    return _to_num(factors.get(field))
+
+
 def _format_score_table(
     scored: list[Any],
     max_rows: int = 30,
     show_score: bool = True,
+    filter_fields: list[str] | None = None,
 ) -> str:
-    """把 RuleVerdict 列表格式化为终端文本表格。"""
+    """把 RuleVerdict 列表格式化为终端文本表格。
+
+    Args:
+        scored:        排序后的 RuleVerdict 列表。
+        max_rows:      最多显示行数。
+        show_score:    是否显示评分列。
+        filter_fields: 筛选条件字段列表，每字段生成一列显示对应股票的实际值。
+                       未提供时使用默认列（PE/PB/ROE/股息率/市值）。
+    """
     if not scored:
         return "(无结果)"
 
@@ -743,12 +1001,18 @@ def _format_score_table(
         fv = float(val)
         return f"{fv:.{precision}f}"
 
-    if show_score:
-        headers = ["排名", "代码", "名称", "总分", "PE_TTM", "PB", "ROE%", "股息率%", "市值(亿)"]
+    # ── build headers ──
+    if filter_fields:
+        field_labels = [_FIELD_LABEL.get(f, f) for f in filter_fields]
+        if show_score:
+            headers = ["排名", "代码", "名称", "总分"] + field_labels
+        else:
+            headers = ["序号", "代码", "名称"] + field_labels
     else:
-        headers = ["序号", "代码", "名称", "PE_TTM", "PB", "ROE%", "股息率%", "市值(亿)"]
-
-    col_offset = 0 if show_score else 1  # 不显示总分列时后续列宽需调整
+        if show_score:
+            headers = ["排名", "代码", "名称", "总分", "PE_TTM", "PB", "ROE%", "股息率%", "市值(亿)"]
+        else:
+            headers = ["序号", "代码", "名称", "PE_TTM", "PB", "ROE%", "股息率%", "市值(亿)"]
 
     lines: list[str] = []
     header_line = " │ ".join(
@@ -761,35 +1025,50 @@ def _format_score_table(
 
     for i, v in enumerate(rows):
         factors = v.factors if hasattr(v, "factors") else {}
-        pe = factors.get("pe_ttm")
-        pb = factors.get("pb")
-        roe = factors.get("roe")
-        div_y = factors.get("dividend_yield")
-        mcap = factors.get("market_cap")
 
-        if show_score:
-            cols = [
-                str(i + 1),
-                str(v.symbol),
-                str(v.name or "")[:8],
-                f"{v.total_score:.2f}",
-                fmt_float(pe),
-                fmt_float(pb),
-                fmt_float(roe, 1),
-                fmt_float(div_y, 2) if div_y is not None else "-",
-                fmt_float(mcap / 1e8, 1) if mcap is not None else "-",
-            ]
+        if filter_fields:
+            # ── dynamic columns from filter conditions ──
+            vals: list[str] = []
+            for field in filter_fields:
+                val = _resolve_field_value(factors, field)
+                if val is None:
+                    vals.append("-")
+                elif field in _MONETARY_FIELDS:
+                    vals.append(f"{val / 1e8:.1f}")
+                elif field in _PCT_FIELDS:
+                    vals.append(f"{val:.1f}")
+                elif field == "eps_growth_10yr_3yr_avg":
+                    vals.append(f"{val:.3f}")
+                else:
+                    vals.append(f"{val:.2f}")
+
+            if show_score:
+                cols = [str(i + 1), str(v.symbol), str(v.name or "")[:8], f"{v.total_score:.2f}"] + vals
+            else:
+                cols = [str(i + 1), str(v.symbol), str(v.name or "")[:8]] + vals
         else:
-            cols = [
-                str(i + 1),
-                str(v.symbol),
-                str(v.name or "")[:8],
-                fmt_float(pe),
-                fmt_float(pb),
-                fmt_float(roe, 1),
-                fmt_float(div_y, 2) if div_y is not None else "-",
-                fmt_float(mcap / 1e8, 1) if mcap is not None else "-",
-            ]
+            # ── fallback: hardcoded old columns ──
+            pe = factors.get("pe_ttm")
+            pb = factors.get("pb")
+            roe = factors.get("roe")
+            div_y = factors.get("dividend_yield")
+            mcap = factors.get("market_cap")
+
+            if show_score:
+                cols = [
+                    str(i + 1), str(v.symbol), str(v.name or "")[:8],
+                    f"{v.total_score:.2f}",
+                    fmt_float(pe), fmt_float(pb), fmt_float(roe, 1),
+                    fmt_float(div_y, 2) if div_y is not None else "-",
+                    fmt_float(mcap / 1e8, 1) if mcap is not None else "-",
+                ]
+            else:
+                cols = [
+                    str(i + 1), str(v.symbol), str(v.name or "")[:8],
+                    fmt_float(pe), fmt_float(pb), fmt_float(roe, 1),
+                    fmt_float(div_y, 2) if div_y is not None else "-",
+                    fmt_float(mcap / 1e8, 1) if mcap is not None else "-",
+                ]
 
         line = " │ ".join(
             f"{c:<8}" if j < 3 else f"{c:<10}"
@@ -859,11 +1138,18 @@ def run_screen(
     # ---- 0. 检查数据新鲜度（筛选只用 basic_info）----
     fs = check_freshness(str(db))
     if fs.price_need:
-        return {
-            "factor_result": None, "rule_result": None, "table": "",
-            "top_symbols": [], "save_name": "", "filters_used": {},
-            "freshness": fs,
-        }
+        if fs.price_count == 0:
+            # 表为空，确实需要先刷新
+            return {
+                "factor_result": None, "rule_result": None, "table": "",
+                "top_symbols": [], "save_name": "", "filters_used": {},
+                "freshness": fs,
+            }
+        # 数据过期但表有数据：后台刷新，本次继续用旧数据
+        print(f"  [!] 行情数据已过期（{fs.price_reason}），后台刷新中，本次使用缓存数据")
+        from app.services.data_refresher import refresh_basic_info
+        import threading
+        threading.Thread(target=refresh_basic_info, args=(str(db),), daemon=True).start()
 
     # ---- 1. 从自然语言提取条件 ----
     extracted = parse_screen_conditions(raw_input) if raw_input else {"filters": {}, "save_name": ""}
@@ -889,7 +1175,7 @@ def run_screen(
                 safety_filters, translated_filters
             )
             # 逐条打印翻译出的条件
-            print(f"  ┌─ 策略翻译结果 ─────────────────────────────")
+            print(f"  ┌─ 策略翻译结果（via LLM）──────────────────")
             print(f"  │ 已翻译条件（{len(translated_filters)} 条）：")
             for i, (field, cond) in enumerate(translated_filters.items(), 1):
                 label = _FIELD_LABEL.get(field, field)
@@ -936,7 +1222,7 @@ def run_screen(
     if extracted_filters:
         print(f"  [+] 应用即时条件: {_format_filters(extracted_filters)}")
 
-    # ---- 5. 加载数据（三表合并：basic_info + income_statement + balance_sheet）----
+    # ---- 5. 加载数据（四表合并：basic_info + income_statement + balance_sheet + dividend_history）----
     print("  ... 加载数据...")
     basic_rows = load_basic_info(str(db))
     if not basic_rows:
@@ -953,9 +1239,19 @@ def run_screen(
     balance_rows = load_latest_financial(str(db), "balance_sheet")
     print(f"  [OK] balance_sheet: {len(balance_rows)} 只")
 
-    # ---- 6. 计算因子（合并三表）----
-    factor_result = compute_factors_with_financials(basic_rows, balance_rows, income_rows)
+    dividend_rows = load_dividend_history(str(db))
+    print(f"  [OK] dividend_history: {len(dividend_rows)} 条")
+
+    # ---- 6. 计算因子（合并四表）----
+    factor_result = compute_factors_with_financials(basic_rows, balance_rows, income_rows, dividend_rows)
     print(f"  [OK] 计算 {factor_result.output_count} 只股票的因子")
+
+    # ---- 6.3. 加载历史利润表数据并计算历史趋势因子 ---- 
+    income_history = load_income_statement_history(str(db))
+    if income_history:
+        factor_result = enrich_with_historical_factors(factor_result, income_history)
+        sample_count = sum(1 for fs in factor_result.factor_sets if fs.eps_growth_10yr_3yr_avg is not None)
+        print(f"  [OK] 历史趋势因子: eps_growth_10yr（{sample_count} 只有效数据）")
 
     # ---- 6.5. 数据可用性检查：剔除全为 None 的筛选字段 ----
     hard_filters = config.get("screen", {}).get("hard_filters", {})
@@ -974,8 +1270,10 @@ def run_screen(
     rule_result = apply_rules(factor_result.enriched_rows, config, filter_only=True)
     print(f"  [OK] 筛选完成：{rule_result.passed_candidates} 只符合条件，共 {len(rule_result.scored)} 只")
 
-    # ---- 8. 生成表格 ----
-    table = _format_score_table(rule_result.scored, max_results, show_score=False)
+    # ---- 8. 生成表格（列 = 筛选条件字段）----
+    hard_filters = config.get("screen", {}).get("hard_filters", {})
+    filter_fields = list(hard_filters.keys()) if hard_filters else None
+    table = _format_score_table(rule_result.scored, max_results, show_score=False, filter_fields=filter_fields)
 
     # ---- 8.5. 标注数据缺失字段 ----
     none_notes = _build_none_notes(rule_result.scored, max_results)
@@ -1004,10 +1302,15 @@ def run_screen(
 
 _FIELD_LABEL = {
     "pe_ttm": "PE(ttm)", "pb": "PB", "roe": "ROE(%)",
-    "dividend_yield": "股息率(%)", "market_cap": "市值(元)",
+    "dividend_yield": "股息率(%)", "pretax_bonus_per_share": "每股股利(元)",
+    "dividend_years_count": "连续分红(年)", "market_cap": "市值(元)",
     "eps_basic": "EPS", "debt_to_equity": "负债权益比", "current_ratio": "流动比率",
     "pe_pb": "PE×PB",
     "revenue": "营收(元)", "total_assets": "总资产(元)",
+    "eps_growth_10yr_3yr_avg": "EPS10年增长", "consecutive_profitable_years": "连续盈利(年)",
+    "pe_3yr_avg": "PE(3年均)",
+    "long_term_borrowings": "长期债务(元)", "net_current_assets": "流动资产净额(元)",
+    "long_term_debt_to_net_ca_ratio": "长期债务/流动资产净额",
 }
 
 

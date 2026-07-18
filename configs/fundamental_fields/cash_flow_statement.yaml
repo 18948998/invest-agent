@@ -38,6 +38,14 @@ fields:
     unit: null
     required: false
     description: 财报对外公告日期。
+  - name: report_type
+    label_zh: 报告类型
+    source_keys:
+      akshare: 报告类型
+    dtype: string
+    unit: null
+    required: false
+    description: 年度报告 / 半年度报告。
   - name: cash_inflow_from_operating_activities
     label_zh: 经营活动现金流入小计
     source_keys:

@@ -1,0 +1,91 @@
+dataset:
+  dataset_id: dividend_history
+  dataset_name_zh: 分红送转历史
+  statement_type: financial_statement
+  version: 1
+  description: A股分红送转全量历史记录。每行为一次分红/送转事件，覆盖1990年至今。
+
+fields:
+  - name: symbol
+    label_zh: 股票代码
+    source_keys:
+      akshare: 股票代码
+    dtype: string
+    required: true
+    description: 证券唯一标识。
+
+  - name: name
+    label_zh: 股票简称
+    source_keys:
+      akshare: 股票简称
+    dtype: string
+    required: false
+
+  - name: plan_profile
+    label_zh: 分配方案
+    source_keys:
+      akshare: 分配方案
+    dtype: string
+    required: false
+    description: 分红方案原文，如"10派280.2423元(含税)"、"10送2转4派1.5元"。
+
+  - name: pretax_bonus_per_share
+    label_zh: 税前每股股利
+    source_keys:
+      akshare: 税前每股股利
+    dtype: float
+    unit: 元/股
+    required: false
+    description: 税前每股现金红利。
+
+  - name: bonus_share_ratio
+    label_zh: 送转股比例
+    source_keys:
+      akshare: 送转股比例
+    dtype: float
+    unit: 股/10股
+    required: false
+
+  - name: assign_progress
+    label_zh: 分配进度
+    source_keys:
+      akshare: 分配进度
+    dtype: string
+    required: false
+    description: 实施分配 / 预披露 / 董事会预案。
+
+  - name: plan_notice_date
+    label_zh: 预案公告日
+    source_keys:
+      akshare: 预案公告日
+    dtype: date
+    required: false
+
+  - name: equity_record_date
+    label_zh: 股权登记日
+    source_keys:
+      akshare: 股权登记日
+    dtype: date
+    required: false
+
+  - name: ex_dividend_date
+    label_zh: 除权除息日
+    source_keys:
+      akshare: 除权除息日
+    dtype: date
+    required: false
+
+  - name: implement_notice_date
+    label_zh: 实施公告日
+    source_keys:
+      akshare: 实施公告日
+    dtype: date
+    required: false
+
+  - name: report_date
+    label_zh: 报告期
+    source_keys:
+      akshare: 报告期
+    dtype: date
+    required: false
+    description: 分红基于的财报报告期，用于与利润表对齐。

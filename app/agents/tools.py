@@ -49,7 +49,7 @@ class RefreshDataInput(BaseModel):
     """刷新数据参数。"""
     data_type: Literal["basic_info", "financials", "both"] = Field(
         default="both",
-        description="basic_info=股价/PE/PB/市值, financials=三张财报表, both=全部",
+        description="basic_info=股价/PE/PB/市值, financials=三张财报+分红送转历史, both=全部",
     )
 
 
@@ -225,7 +225,7 @@ def create_tools(db_path: str) -> list[StructuredTool]:
         name="refresh_data",
         description=(
             "刷新/更新数据库。当 screen_stocks 或 analyze_stock 返回 needs_refresh 时必须调用。"
-            "data_type: basic_info(股价PE/PB/市值), financials(财报), both(全部)。"
+            "data_type: basic_info(股价/PE/PB/市值), financials(三张财报+分红送转历史), both(全部)。"
         ),
         args_schema=RefreshDataInput,
     )

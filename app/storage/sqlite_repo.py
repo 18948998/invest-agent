@@ -40,22 +40,70 @@ def save_dataset(
     )
     key_field = "symbol"
 
+    # 判断是否为财报表（带 report_date 字段），决定去重键
+    has_report_date = any(f.name == "report_date" for f in dataset_spec.fields)
+
     with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         cursor = conn.cursor()
         if replace:
             cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
             cursor.execute(f'CREATE TABLE "{table_name}" ({columns_sql})')
         else:
             cursor.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({columns_sql})')
+            # --- schema 自动补齐：如果表已存在但缺某些列，动态 ALTER TABLE ADD COLUMN ---
+            existing_cols = {
+                row[1]
+                for row in cursor.execute(f'PRAGMA table_info("{table_name}")').fetchall()
+            }
+            for field in dataset_spec.fields:
+                if field.name not in existing_cols:
+                    col_def = f'"{field.name}" {_sqlite_type(field.dtype)}'
+                    try:
+                        cursor.execute(f'ALTER TABLE "{table_name}" ADD COLUMN {col_def}')
+                        logger.info("自动补齐列: %s.%s (%s)", table_name, field.name, _sqlite_type(field.dtype))
+                    except sqlite3.OperationalError as exc:
+                        logger.warning("无法添加列 %s.%s: %s", table_name, field.name, exc)
 
         if rows:
-            key_values = sorted({row.get(key_field) for row in rows if row.get(key_field) is not None})
-            if key_values:
-                delete_placeholders = ", ".join(["?"] * len(key_values))
-                cursor.execute(
-                    f'DELETE FROM "{table_name}" WHERE "{key_field}" IN ({delete_placeholders})',
-                    key_values,
-                )
+            if table_name == "dividend_history" and not replace:
+                # 分红历史：用 (symbol, plan_notice_date) 去重
+                # 同一 report_date 下可能有多次分红事件（中期+年末），预案公告日唯一
+                pairs = sorted({
+                    (row.get("symbol"), row.get("plan_notice_date") or row.get("report_date"))
+                    for row in rows
+                    if row.get("symbol") is not None
+                })
+                if pairs:
+                    ph = ", ".join(["(?, ?)"] * len(pairs))
+                    flat = [v for p in pairs for v in p]
+                    cursor.execute(
+                        f'DELETE FROM "{table_name}" WHERE ("symbol","plan_notice_date") IN ({ph})',
+                        flat,
+                    )
+            elif has_report_date and not replace:
+                # 财报表：用 (symbol, report_date) 复合主键去重，支持多年并存
+                pairs = sorted({
+                    (row.get("symbol"), row.get("report_date"))
+                    for row in rows
+                    if row.get("symbol") is not None and row.get("report_date") is not None
+                })
+                if pairs:
+                    ph = ", ".join(["(?, ?)"] * len(pairs))
+                    flat = [v for p in pairs for v in p]
+                    cursor.execute(
+                        f'DELETE FROM "{table_name}" WHERE ("symbol","report_date") IN ({ph})',
+                        flat,
+                    )
+            else:
+                # basic_info：symbol 单键去重（保持原有行为）
+                key_values = sorted({row.get(key_field) for row in rows if row.get(key_field) is not None})
+                if key_values:
+                    delete_placeholders = ", ".join(["?"] * len(key_values))
+                    cursor.execute(
+                        f'DELETE FROM "{table_name}" WHERE "{key_field}" IN ({delete_placeholders})',
+                        key_values,
+                    )
             values = [tuple(row.get(name) for name in column_names) for row in rows]
             cursor.executemany(insert_sql, values)
         conn.commit()
@@ -135,13 +183,15 @@ class DataFreshness:
     """一次数据新鲜度检查的结果。"""
     is_price_stale: bool      # basic_info 是否过期（> 1 天）
     is_financial_stale: bool  # 三张财报是否过期（> 1 个月）
+    is_dividend_stale: bool   # 分红数据是否过期（> 1 个月）
     price_last_update: str | None
     financial_last_update: str | None
+    dividend_last_update: str | None
     db_path: Path
 
     @property
     def any_stale(self) -> bool:
-        return self.is_price_stale or self.is_financial_stale
+        return self.is_price_stale or self.is_financial_stale or self.is_dividend_stale
 
     @property
     def stale_tracks(self) -> list[str]:
@@ -150,6 +200,8 @@ class DataFreshness:
             tracks.append("price")
         if self.is_financial_stale:
             tracks.append("financial")
+        if self.is_dividend_stale:
+            tracks.append("dividend")
         return tracks
 
 
@@ -158,17 +210,21 @@ def check_data_freshness(db_path: Path) -> DataFreshness:
 
     basic_info（股价/估值）超过 1 天 → price_stale
     财报三表超过 1 个月 → financial_stale
+    分红数据超过 1 个月 → dividend_stale
     """
     now = datetime.now(timezone.utc)
 
     price_record = get_last_update(db_path, "price")
     financial_record = get_last_update(db_path, "financial")
+    dividend_record = get_last_update(db_path, "dividend")
 
     _price_last = price_record["updated_at"] if price_record else None
     _fin_last = financial_record["updated_at"] if financial_record else None
+    _div_last = dividend_record["updated_at"] if dividend_record else None
 
     price_stale = True
     financial_stale = True
+    dividend_stale = True
 
     if _price_last:
         try:
@@ -184,11 +240,20 @@ def check_data_freshness(db_path: Path) -> DataFreshness:
         except ValueError:
             pass
 
+    if _div_last:
+        try:
+            last = datetime.strptime(_div_last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            dividend_stale = (now - last) > timedelta(days=30)
+        except ValueError:
+            pass
+
     return DataFreshness(
         is_price_stale=price_stale,
         is_financial_stale=financial_stale,
+        is_dividend_stale=dividend_stale,
         price_last_update=_price_last,
         financial_last_update=_fin_last,
+        dividend_last_update=_div_last,
         db_path=db_path,
     )
 

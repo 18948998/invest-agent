@@ -112,7 +112,8 @@ def create_chat_model(**overrides: Any) -> Any:
         "model": config.model_name,
         "temperature": config.temperature,
         "max_tokens": config.max_tokens,
-        "timeout": config.timeout,
+        "request_timeout": config.timeout,
+        "max_retries": 1,
     }
 
     if config.api_key:

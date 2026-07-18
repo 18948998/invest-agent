@@ -93,6 +93,9 @@ def check_freshness(db_path_str: str) -> FreshnessStatus:
     fin_empty = bs_count == 0 or is_count == 0
     fin_count = min(bs_count, is_count)
 
+    # --- 分红 ---
+    div_empty = not _ensure_table(db, "dividend_history")
+
     # --- 汇总判断 ---
     price_need = basic_empty or freshness.is_price_stale or basic_count < MIN_ROWS
     price_reason = (
@@ -109,6 +112,11 @@ def check_freshness(db_path_str: str) -> FreshnessStatus:
         else f"数据不全（仅 {fin_count} 行）" if fin_count < MIN_ROWS
         else ""
     )
+
+    # 分红表为空时也标记需要刷新（财报刷新会同时拉分红）
+    if div_empty and not financial_need:
+        financial_need = True
+        financial_reason = "分红表为空"
 
     status = FreshnessStatus(
         needs_refresh=price_need or financial_need,
@@ -176,6 +184,15 @@ def _quote(identifier: str) -> str:
     if not identifier.replace("_", "").replace(".", "").isalnum():
         raise ValueError(f"Illegal identifier: {identifier!r}")
     return f'"{identifier}"'
+
+
+def _table_columns(db_path: Path, table: str) -> list[str]:
+    """返回表中实际存在的列名列表（防御旧 schema 缺列问题）。"""
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            return [row[1] for row in conn.execute(f"PRAGMA table_info({_quote(table)})").fetchall()]
+    except Exception:
+        return []
 
 
 def _rows_to_dicts(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
@@ -252,16 +269,19 @@ def load_latest_financial(
     table: str,
     symbols: list[str] | None = None,
     fields: list[str] | None = None,
+    report_type: str = "年报",
 ) -> list[dict[str, Any]]:
     """加载财报表（income_statement / balance_sheet / cash_flow_statement）最新一期数据。
 
-    每只股票取 report_date 最大的记录，与 basic_info 通过 symbol 对齐。
+    每只股票取 report_date 最大的记录，默认只取年报（report_type='年报'），
+    与 basic_info 通过 symbol 对齐。
 
     Args:
         db_path:  SQLite 数据库文件路径。
         table:   表名（income_statement / balance_sheet / cash_flow_statement）。
         symbols: 要查询的股票代码列表，为 None 则查全部。
         fields:  要返回的字段列表，为 None 则返回所有字段（排除 key 字段重复）。
+        report_type: 报告类型过滤，"年度报告"（默认）或 "半年度报告"。
 
     Returns:
         list[dict] —— 每只股票最新的财报记录。
@@ -296,36 +316,219 @@ def load_latest_financial(
 
     col_str = ", ".join(_quote(c) for c in columns)
 
-    # 子查询：每只股票最新的 report_date
-    inner_where = ""
-    inner_params: list[str] = []
-    outer_params: list[str] = []
-    if symbols:
-        placeholders = ", ".join(["?"] * len(symbols))
-        inner_where = f" WHERE symbol IN ({placeholders})"
-        inner_params = list(symbols)
-        outer_params = list(symbols)
+    # 防御性检查：report_type 列是否存在且有实际数据
+    # 旧 schema 无此列，或列存在但全是 NULL（数据源未填充）→ 跳过过滤
+    actual_cols = _table_columns(db, table)
+    has_report_type = "report_type" in actual_cols
+    if has_report_type:
+        try:
+            with sqlite3.connect(str(db)) as conn:
+                cnt = conn.execute(
+                    f"SELECT COUNT(*) FROM {_quote(table)} WHERE report_type IS NOT NULL"
+                ).fetchone()[0]
+            if cnt == 0:
+                has_report_type = False
+                logger.info(
+                    "%s 表 report_type 列全为 NULL（数据源未填充），跳过报告类型过滤", table
+                )
+        except sqlite3.OperationalError:
+            has_report_type = False
 
-    query = f"""
-        SELECT {col_str}
-        FROM {_quote(table)}
-        WHERE (symbol, report_date) IN (
-            SELECT symbol, MAX(report_date)
+    if has_report_type:
+        # 子查询：每只股票最新的 report_date（按 report_type 过滤，默认年报）
+        inner_where = "WHERE report_type = ?"
+        inner_params: list[str] = [report_type]
+        outer_params: list[str] = []
+        if symbols:
+            placeholders = ", ".join(["?"] * len(symbols))
+            inner_where += f" AND symbol IN ({placeholders})"
+            inner_params.extend(symbols)
+            outer_params = list(symbols)
+
+        query = f"""
+            SELECT {col_str}
             FROM {_quote(table)}
-            {inner_where}
-            GROUP BY symbol
-        )
-    """
-    if outer_params:
-        query += f" AND symbol IN ({', '.join(['?'] * len(outer_params))})"
+            WHERE (symbol, report_date) IN (
+                SELECT symbol, MAX(report_date)
+                FROM {_quote(table)}
+                {inner_where}
+                GROUP BY symbol
+            )
+            AND report_type = ?
+        """
+        if outer_params:
+            query += f" AND symbol IN ({', '.join(['?'] * len(outer_params))})"
+
+        params = inner_params + outer_params + [report_type]
+    else:
+        # 旧 schema 没有 report_type 列，跳过过滤直接取最新 report_date
+        logger.info("%s 表缺少 report_type 列（旧 schema），跳过报告类型过滤", table)
+        inner_params: list[str] = []
+        symbol_filter = ""
+        if symbols:
+            placeholders = ", ".join(["?"] * len(symbols))
+            symbol_filter = f" WHERE symbol IN ({placeholders})"
+            inner_params.extend(symbols)
+
+        query = f"""
+            SELECT {col_str}
+            FROM {_quote(table)}
+            WHERE (symbol, report_date) IN (
+                SELECT symbol, MAX(report_date)
+                FROM {_quote(table)}
+                {symbol_filter}
+                GROUP BY symbol
+            )
+        """
+        if symbols:
+            query += f" AND symbol IN ({', '.join(['?'] * len(symbols))})"
+        params = inner_params + (list(symbols) if symbols else [])
 
     try:
         with sqlite3.connect(str(db)) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.execute(query, inner_params + outer_params)
+            cursor = conn.execute(query, params)
             return _rows_to_dicts(cursor)
     except sqlite3.OperationalError as exc:
         logger.warning("%s 查询失败: %s", table, exc)
+        return []
+
+
+DEFAULT_DIVIDEND_FIELDS: tuple[str, ...] = (
+    "symbol", "name",
+    "plan_profile", "pretax_bonus_per_share", "bonus_share_ratio",
+    "assign_progress", "plan_notice_date", "equity_record_date",
+    "ex_dividend_date", "implement_notice_date", "report_date",
+)
+
+
+def load_income_statement_history(
+    db_path: str | Path,
+    symbols: list[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """加载利润表的全部历史记录，按 symbol 分组供历史趋势因子计算。
+
+    用于计算 defance 策略中的"过去10年 EPS 增长"和"连续盈利年数"等条件。
+
+    Args:
+        db_path: SQLite 数据库文件路径。
+        symbols: 要查询的股票代码列表，为 None 则查全部。
+
+    Returns:
+        dict[str, list[dict]]: {symbol: [{report_date, eps_basic, net_profit, ...}, ...]}
+        每个 symbol 的记录按 report_date 降序排列（最新在前）。
+    """
+    db = Path(db_path)
+    table = "income_statement"
+
+    if not _ensure_table(db, table):
+        logger.warning("income_statement 表不存在，无法加载历史数据")
+        return {}
+
+    actual_cols = _table_columns(db, table)
+    # 至少需要 symbol 和 eps_basic
+    needed = {"symbol", "report_date", "eps_basic", "net_profit", "net_profit_attributable_to_parent"}
+    available = [c for c in needed if c in actual_cols]
+    if "symbol" not in available:
+        return {}
+
+    col_str = ", ".join(_quote(c) for c in available)
+
+    query = f"SELECT {col_str} FROM {_quote(table)}"
+    params: list[str] = []
+    conditions: list[str] = [
+        "report_date LIKE '%-12-31'"   # 只取年报（report_date = YYYY-12-31）
+    ]
+
+    if symbols:
+        placeholders = ", ".join(["?"] * len(symbols))
+        conditions.append(f"symbol IN ({placeholders})")
+        params.extend(symbols)
+
+    query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY report_date DESC"
+
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query, params)
+            rows = _rows_to_dicts(cursor)
+    except sqlite3.OperationalError as exc:
+        logger.warning("income_statement 历史查询失败: %s", exc)
+        return {}
+
+    # 按 symbol 分组
+    from collections import defaultdict
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        sym = str(row.get("symbol", ""))
+        if sym:
+            grouped[sym].append(row)
+
+    return dict(grouped)
+
+
+def load_dividend_history(
+    db_path: str | Path,
+    symbols: list[str] | None = None,
+    fields: list[str] | None = None,
+    order_by: str = "plan_notice_date DESC",
+) -> list[dict[str, Any]]:
+    """从 dividend_history 表加载分红送转历史数据。
+
+    Args:
+        db_path: SQLite 数据库文件路径。
+        symbols: 要查询的股票代码列表，为 None 则查全部。
+        fields:  要返回的字段列表，为 None 则返回所有默认字段。
+        order_by: 排序方式，默认按预案公告日降序（最新的在前）。
+
+    Returns:
+        list[dict] —— 每次分红事件一行。表不存在或没数据时返回空列表。
+
+    Example:
+        >>> rows = load_dividend_history("data/invest.db", symbols=["600519"])
+        >>> rows[0]["plan_profile"], rows[0]["pretax_bonus_per_share"]
+        ('10派280.2423元(含税)', 28.02423)
+    """
+    db = Path(db_path)
+    table = "dividend_history"
+
+    allowed = frozenset(_TABLE_SCHEMAS.get(table, {}))
+    if fields is None:
+        columns = [f for f in DEFAULT_DIVIDEND_FIELDS if f in allowed]
+    else:
+        columns = [f for f in fields if f in allowed]
+        unknown = set(fields) - allowed
+        if unknown:
+            logger.warning("dividend_history 查询含未知字段，已忽略: %s", unknown)
+
+    if not columns:
+        logger.warning("dividend_history 无有效字段可查询")
+        return []
+
+    if not _ensure_table(db, table):
+        logger.warning("dividend_history 表不存在: %s", db)
+        return []
+
+    col_str = ", ".join(_quote(c) for c in columns)
+    query = f"SELECT {col_str} FROM {_quote(table)}"
+
+    params: list[str] = []
+    if symbols:
+        placeholders = ", ".join(["?"] * len(symbols))
+        query += f" WHERE symbol IN ({placeholders})"
+        params.extend(symbols)
+
+    if order_by:
+        query += f" ORDER BY {order_by}"
+
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query, params)
+            return _rows_to_dicts(cursor)
+    except sqlite3.OperationalError as exc:
+        logger.warning("dividend_history 查询失败: %s", exc)
         return []
 
 

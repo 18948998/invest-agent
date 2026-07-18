@@ -265,18 +265,97 @@ def _build_row(code: str, name, price, pe=None, pb=None, market_cap=None):
 
 _H = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Referer":"https://data.eastmoney.com/"}
 _URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
-_REPORTS = {"balance_sheet":"RPT_F10_FINANCE_GBALANCE","income_statement":"RPT_F10_FINANCE_GINCOME","cash_flow_statement":"RPT_F10_FINANCE_GCASHFLOW"}
+_REPORTS = {"balance_sheet":"RPT_F10_FINANCE_GBALANCE","income_statement":"RPT_F10_FINANCE_GINCOME","cash_flow_statement":"RPT_F10_FINANCE_GCASHFLOW","dividend":"RPT_SHAREBONUS_DET"}
 
 def _fetch_financial_direct(symbols, max_periods, ds_id):
+	"""串行拉取财报（保留兼容，新代码请用 fetch_one_financial_record）。"""
 	report = _REPORTS[ds_id]; mapper = _MAPPERS[ds_id]; total = len(symbols)
 	rows = []
 	for i, sym in enumerate(symbols):
 		if (i+1)%30==0 or i==total-1: print(f"  {ds_id} {i+1}/{total}", flush=True)
 		try:
 			data = _api_fetch(sym, report, max_periods)
+			# 只保留年报和半年报，丢弃一季报/三季报
+			data = [d for d in data if d.get("REPORT_TYPE") in ("年度报告", "半年度报告")]
 			rows.extend(mapper(data, sym))
 		except Exception: continue
 	return rows
+
+
+def fetch_one_financial_record(symbol: str, ds_id: str, max_periods: int) -> list[dict[str, Any]]:
+	"""拉取单只股票的财报原始数据并经 mapper 映射。
+
+	线程安全：所有状态均为函数局部变量，可被多线程并发调用。
+
+	Args:
+		symbol:      股票代码（如 '600519'）。
+		ds_id:       数据集 ID（balance_sheet / income_statement / cash_flow_statement）。
+		max_periods: 最多拉取期数。
+
+	Returns:
+		映射后的行列表，为空时返回 []。
+	"""
+	report = _REPORTS[ds_id]
+	mapper = _MAPPERS[ds_id]
+	data = _api_fetch(symbol, report, max_periods)
+	# 只保留年报：A 股会计准则规定财年截止日为 12-31，因此年报 report_date 后缀必为 -12-31
+	# 注意：report_date 是报告期，不是发布日（announce_date 才是次年 3~4 月发布）
+	data = [d for d in data if (
+		str(d.get("REPORT_TYPE", "")) == "年度报告" or
+		(d.get("REPORT_DATE") and "-12-31" in str(d["REPORT_DATE"]))
+	)]
+	return mapper(data, symbol)
+
+
+def fetch_one_dividend_record(symbol: str) -> list[dict[str, Any]]:
+	"""拉取单只股票全量历史分红送转记录（1990 年起）。
+
+	与财报接口使用同一个 datacenter-web base URL，但参数不同：
+	- 用 startDate/endDate 控制时间范围而非 pageSize 限制期数
+	- 排序字段使用 PLAN_NOTICE_DATE
+
+	线程安全：所有状态均为函数局部变量，可被多线程并发调用。
+
+	Args:
+		symbol: 股票代码（如 '600519'）。
+
+	Returns:
+		映射后的分红行列表，为空时返回 []。
+	"""
+	data = _api_fetch_dividend(symbol)
+	if not data:
+		return []
+	mapper = _MAPPERS["dividend"]
+	return mapper(data, symbol)
+
+
+def _api_fetch_dividend(symbol: str) -> list[dict[str, Any]]:
+	"""从东方财富数据中心拉取单只股票全量历史分红明细。
+
+	使用 reportName=RPT_SHAREBONUS_DET，通过 startDate/endDate
+	获取所有历史记录（最大 pageSize=500，覆盖全量）。"""
+	secu = f"{symbol}.SH" if symbol.startswith(("6", "9")) else f"{symbol}.SZ"
+	params = {
+		"reportName": _REPORTS["dividend"],
+		"columns": "ALL",
+		"filter": f'(SECUCODE="{secu}")',
+		"pageNumber": "1",
+		"pageSize": "500",
+		"sortTypes": "-1",
+		"sortColumns": "PLAN_NOTICE_DATE",
+		"startDate": "1990-01-01",
+		"endDate": "2099-12-31",
+	}
+	for attempt in range(3):
+		try:
+			r = requests.get(_URL, params=params, headers=_H, timeout=15)
+			r.raise_for_status()
+			d = r.json().get("result", {}).get("data")
+			return d if isinstance(d, list) else []
+		except Exception:
+			if attempt < 2:
+				time.sleep(1 + attempt)
+	return []
 
 def _api_fetch(symbol, report_name, N):
 	secu = f"{symbol}.SH" if symbol.startswith(("6","9")) else f"{symbol}.SZ"
@@ -290,10 +369,28 @@ def _api_fetch(symbol, report_name, N):
 			if attempt<2: time.sleep(1+attempt)
 	return []
 
+_REPORT_TYPE_MAP = {"004": "年度报告"}
+
+def _get_report_type(r):
+	"""根据 report_date 后缀判断报告类型（A 股年报 report_date 始终为 YYYY-12-31）。"""
+	rt = r.get("REPORT_TYPE")
+	if rt: return rt
+	rd = str(r.get("REPORT_DATE", ""))
+	if "-12-31" in rd:
+		return "年报"
+	return None
+
+_SHARE_MAP: dict[str, float] = {}
+
+def _parse_float(v):
+	if v is None or str(v) in ("nan",""): return None
+	return float(v)
+
 _MAPPERS = {
-"balance_sheet": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"货币资金":r.get("MONETARYFUNDS"),"应收账款":r.get("ACCOUNTS_RECE"),"存货":r.get("INVENTORY"),"流动资产合计":r.get("TOTAL_CURRENT_ASSETS"),"固定资产":r.get("FIXED_ASSET"),"无形资产":r.get("INTANGIBLE_ASSET"),"商誉":r.get("GOODWILL"),"资产总计":r.get("TOTAL_ASSETS"),"短期借款":r.get("SHORT_LOAN"),"流动负债合计":r.get("TOTAL_CURRENT_LIAB"),"长期借款":r.get("LONG_LOAN"),"负债合计":r.get("TOTAL_LIABILITIES"),"股本":r.get("SHARE_CAPITAL"),"未分配利润":r.get("UNASSIGN_RPOFIT"),"归属于母公司股东权益合计":r.get("TOTAL_PARENT_EQUITY")} for r in rows],
-"income_statement": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"营业总收入":r.get("TOTAL_OPERATE_INCOME"),"营业收入":r.get("OPERATE_INCOME"),"营业成本":r.get("OPERATE_COST"),"销售费用":r.get("SALE_EXPENSE"),"管理费用":r.get("MANAGE_EXPENSE"),"研发费用":r.get("RESEARCH_EXPENSE"),"财务费用":r.get("FINANCE_EXPENSE"),"营业利润":r.get("OPERATE_PROFIT"),"利润总额":r.get("TOTAL_PROFIT"),"所得税费用":r.get("INCOME_TAX"),"净利润":r.get("NETPROFIT"),"归属于母公司股东的净利润":r.get("PARENT_NETPROFIT"),"扣除非经常性损益后的净利润":r.get("DEDUCT_PARENT_NETPROFIT"),"基本每股收益":r.get("BASIC_EPS"),"稀释每股收益":r.get("DILUTED_EPS")} for r in rows],
-"cash_flow_statement": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"经营活动产生的现金流量流入小计":r.get("TOTAL_OPERATE_INFLOW"),"经营活动产生的现金流量流出小计":r.get("TOTAL_OPERATE_OUTFLOW"),"经营活动产生的现金流量净额":r.get("NETCASH_OPERATE"),"购建固定资产、无形资产和其他长期资产支付的现金":r.get("CONSTRUCT_LONG_ASSET"),"投资活动产生的现金流量净额":r.get("NETCASH_INVEST"),"筹资活动产生的现金流量净额":r.get("NETCASH_FINANCE"),"现金及现金等价物净增加额":r.get("CCE_ADD"),"期末现金及现金等价物余额":r.get("END_CCE")} for r in rows],
+"balance_sheet": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"报告类型":_get_report_type(r),"货币资金":r.get("MONETARYFUNDS"),"应收账款":r.get("ACCOUNTS_RECE"),"存货":r.get("INVENTORY"),"流动资产合计":r.get("TOTAL_CURRENT_ASSETS"),"固定资产":r.get("FIXED_ASSET"),"无形资产":r.get("INTANGIBLE_ASSET"),"商誉":r.get("GOODWILL"),"资产总计":r.get("TOTAL_ASSETS"),"短期借款":r.get("SHORT_LOAN"),"流动负债合计":r.get("TOTAL_CURRENT_LIAB"),"长期借款":r.get("LONG_LOAN"),"负债合计":r.get("TOTAL_LIABILITIES"),"股本":r.get("SHARE_CAPITAL"),"未分配利润":r.get("UNASSIGN_RPOFIT"),"归属于母公司股东权益合计":r.get("TOTAL_PARENT_EQUITY")} for r in rows],
+"income_statement": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"报告类型":_get_report_type(r),"营业总收入":r.get("TOTAL_OPERATE_INCOME"),"营业收入":r.get("OPERATE_INCOME"),"营业成本":r.get("OPERATE_COST"),"销售费用":r.get("SALE_EXPENSE"),"管理费用":r.get("MANAGE_EXPENSE"),"研发费用":r.get("RESEARCH_EXPENSE"),"财务费用":r.get("FINANCE_EXPENSE"),"营业利润":r.get("OPERATE_PROFIT"),"利润总额":r.get("TOTAL_PROFIT"),"所得税费用":r.get("INCOME_TAX"),"净利润":r.get("NETPROFIT"),"归属于母公司股东的净利润":r.get("PARENT_NETPROFIT"),"扣除非经常性损益后的净利润":r.get("DEDUCT_PARENT_NETPROFIT"),"基本每股收益":r.get("BASIC_EPS"),"稀释每股收益":r.get("DILUTED_EPS")} for r in rows],
+"cash_flow_statement": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"报告期":_fmt_date(r.get("REPORT_DATE")),"公告日期":_fmt_date(r.get("NOTICE_DATE")),"报告类型":_get_report_type(r),"经营活动产生的现金流量流入小计":r.get("TOTAL_OPERATE_INFLOW"),"经营活动产生的现金流量流出小计":r.get("TOTAL_OPERATE_OUTFLOW"),"经营活动产生的现金流量净额":r.get("NETCASH_OPERATE"),"购建固定资产、无形资产和其他长期资产支付的现金":r.get("CONSTRUCT_LONG_ASSET"),"投资活动产生的现金流量净额":r.get("NETCASH_INVEST"),"筹资活动产生的现金流量净额":r.get("NETCASH_FINANCE"),"现金及现金等价物净增加额":r.get("CCE_ADD"),"期末现金及现金等价物余额":r.get("END_CCE")} for r in rows],
+"dividend": lambda rows,sym: [{"股票代码":r.get("SECURITY_CODE") or sym,"股票简称":r.get("SECURITY_NAME_ABBR"),"分配方案":r.get("IMPL_PLAN_PROFILE"),"税前每股股利":r.get("PRETAX_BONUS_RMB"),"送转股比例":r.get("BONUS_IT_RATIO"),"分配进度":r.get("ASSIGN_PROGRESS"),"预案公告日":_fmt_date(r.get("PLAN_NOTICE_DATE")),"股权登记日":_fmt_date(r.get("EQUITY_RECORD_DATE")),"除权除息日":_fmt_date(r.get("EX_DIVIDEND_DATE")),"实施公告日":_fmt_date(r.get("NOTICE_DATE")),"报告期":_fmt_date(r.get("REPORT_DATE"))} for r in rows],
 }
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,14 @@ FIELD_ALIASES_ZH: dict[str, str] = {
     "净资产收益率": "roe",     "roe": "roe",           "每股收益": "eps_basic",
     # 分红
     "股息率": "dividend_yield", "分红率": "dividend_yield",
+    "每股派息": "pretax_bonus_per_share", "每股股利": "pretax_bonus_per_share",
+    "每股分红": "pretax_bonus_per_share", "税前每股": "pretax_bonus_per_share",
+    "连续分红年数": "dividend_years_count", "持续分红年数": "dividend_years_count",
+    "连续支付股息": "dividend_years_count", "分红年数": "dividend_years_count",
+    "连续分红": "dividend_years_count", "持续分红": "dividend_years_count",
+    # PE(3年均) —— 用最近3年EPS均值计算的市盈率
+    "3年平均利润": "pe_3yr_avg", "三年平均利润": "pe_3yr_avg",
+    "过去3年平均利润": "pe_3yr_avg", "三年平均的利润": "pe_3yr_avg",
     # 规模
     "市值": "market_cap",     "总市值": "market_cap",
     # 营收（利润表）
@@ -56,7 +64,11 @@ FIELD_ALIASES_ZH: dict[str, str] = {
     "负债": "debt_to_equity",
     "流动比率": "current_ratio",       "流动比": "current_ratio",
     "流动资产": "current_ratio",
-    "长期债务": "debt_to_equity",
+    "长期债务": "long_term_borrowings",
+    # 流动资产净额
+    "流动资产净额": "net_current_assets", "净流动资产": "net_current_assets",
+    # 长期债务/流动资产净额
+    "长期债务.*流动资产净额": "long_term_debt_to_net_ca_ratio",
     # 复合指标
     "市盈率×市净率": "pe_pb",  "市盈率乘市净率": "pe_pb",
     "pe乘pb": "pe_pb",        "市盈率与价格账面值之比的乘积": "pe_pb",
@@ -65,6 +77,11 @@ FIELD_ALIASES_ZH: dict[str, str] = {
     "利润的": "pe_ttm",       "股价": "pe_ttm",
     # 每股
     "每股基本收益": "eps_basic", "eps": "eps_basic",
+    # 历史趋势因子
+    "eps增长": "eps_growth_10yr_3yr_avg", "每股收益增长": "eps_growth_10yr_3yr_avg",
+    "每股利润增长": "eps_growth_10yr_3yr_avg", "eps_growth": "eps_growth_10yr_3yr_avg",
+    "每年都有利润": "consecutive_profitable_years", "每年盈利": "consecutive_profitable_years",
+    "连续盈利": "consecutive_profitable_years",
 }
 
 # =============================================================================
@@ -78,6 +95,16 @@ COMPUTED_FIELDS: dict[str, dict[str, Any]] = {
         "display": "PE × PB",
         "description": "市盈率与市净率的乘积（格雷厄姆深度价值条件）",
     },
+    "net_current_assets": {
+        "fields": ["total_current_assets", "total_current_liabilities"],
+        "display": "流动资产净额",
+        "description": "流动资产合计 - 流动负债合计",
+    },
+    "long_term_debt_to_net_ca_ratio": {
+        "fields": ["long_term_borrowings", "net_current_assets"],
+        "display": "长期债务/流动资产净额",
+        "description": "长期借款 ÷ (流动资产合计 - 流动负债合计)",
+    },
 }
 
 # =============================================================================
@@ -86,10 +113,15 @@ COMPUTED_FIELDS: dict[str, dict[str, Any]] = {
 
 _FIELD_LABEL: dict[str, str] = {
     "pe_ttm": "PE(ttm)",        "pb": "PB",             "roe": "ROE(%)",
-    "dividend_yield": "股息率(%)", "market_cap": "市值(元)",
+    "dividend_yield": "股息率(%)", "pretax_bonus_per_share": "每股股利(元)",
+    "dividend_years_count": "连续分红(年)", "market_cap": "市值(元)",
     "eps_basic": "EPS",         "debt_to_equity": "负债权益比",
     "current_ratio": "流动比率",  "pe_pb": "PE×PB",
     "revenue": "营收(元)",       "total_assets": "总资产(元)",
+    "eps_growth_10yr_3yr_avg": "EPS10年增长", "consecutive_profitable_years": "连续盈利(年)",
+    "pe_3yr_avg": "PE(3年均)",
+    "long_term_borrowings": "长期债务(元)", "net_current_assets": "流动资产净额(元)",
+    "long_term_debt_to_net_ca_ratio": "长期债务/流动资产净额",
 }
 
 
@@ -322,15 +354,44 @@ def apply_rules(
         "current_ratio": "current_ratio",
         "revenue": "revenue",            # 利润表：营业收入
         "total_assets": "total_assets",  # 资产负债表：总资产
+        "dividend_years_count": "dividend_years_count",
+        "pretax_bonus_per_share": "pretax_bonus_per_share",
+        "eps_growth_10yr_3yr_avg": "eps_growth_10yr_3yr_avg",
+        "consecutive_profitable_years": "consecutive_profitable_years",
+        "pe_3yr_avg": "pe_3yr_avg",      # PE(3年均)
+        "long_term_borrowings": "long_term_borrowings",
+        "net_current_assets": "net_current_assets",
+        "long_term_debt_to_net_ca_ratio": "long_term_debt_to_net_ca_ratio",
     }
 
     # 辅助：从候选数据中提取规则值（支持计算字段）
     def _resolve_value(candidate: dict[str, Any], rule_name: str) -> float | None:
         if rule_name in COMPUTED_FIELDS:
-            pe = _safe_float(candidate.get("pe_ttm"))
-            pb = _safe_float(candidate.get("pb"))
-            if pe is not None and pb is not None:
-                return pe * pb
+            if rule_name == "pe_pb":
+                pe = _safe_float(candidate.get("pe_ttm"))
+                pb = _safe_float(candidate.get("pb"))
+                if pe is not None and pb is not None:
+                    return pe * pb
+                return None
+            if rule_name == "net_current_assets":
+                tca = _safe_float(candidate.get("total_current_assets"))
+                tcl = _safe_float(candidate.get("total_current_liabilities"))
+                if tca is not None and tcl is not None:
+                    return tca - tcl
+                return None
+            if rule_name == "long_term_debt_to_net_ca_ratio":
+                ltb = _safe_float(candidate.get("long_term_borrowings"))
+                nca = _safe_float(candidate.get("net_current_assets"))
+                if ltb is not None and nca is not None and nca > 0:
+                    return ltb / nca
+                # 兜底直接用原始字段计算
+                tca = _safe_float(candidate.get("total_current_assets"))
+                tcl = _safe_float(candidate.get("total_current_liabilities"))
+                if ltb is not None and tca is not None and tcl is not None:
+                    nca2 = tca - tcl
+                    if nca2 > 0:
+                        return ltb / nca2
+                return None
             return None
         field = _field_map.get(rule_name, rule_name)
         return _safe_float(candidate.get(field))

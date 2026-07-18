@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Thread
 from typing import Any
 
@@ -13,7 +15,7 @@ from app.config.loader import load_fundamental_field_specs, load_specs_by_track
 from app.config.schema import DatasetSpec
 from app.data.normalizer import normalize_records
 from app.data.validator import ValidationResult, validate_records
-from app.services.fundamental_data import fetch_raw_dataset, save_valid_codes_from_rows, is_main_gem_star_symbol
+from app.services.fundamental_data import fetch_raw_dataset, fetch_one_financial_record, fetch_one_dividend_record, save_valid_codes_from_rows, is_main_gem_star_symbol
 from app.storage.sqlite_repo import save_dataset, get_latest_eps_batch
 
 
@@ -48,6 +50,7 @@ def _preview_fields(dataset_id: str, spec) -> list[str]:
         "balance_sheet": ["symbol", "name", "report_date", "announce_date", "total_assets", "total_liabilities"],
         "income_statement": ["symbol", "name", "report_date", "announce_date", "net_profit", "revenue"],
         "cash_flow_statement": ["symbol", "name", "report_date", "announce_date", "net_cash_flow_from_operating_activities"],
+        "dividend_history": ["symbol", "name", "plan_profile", "pretax_bonus_per_share", "ex_dividend_date"],
     }.get(dataset_id, [field.name for field in spec.fields])
     label_map = _field_label_map(spec)
     return [label_map.get(name, name) for name in preferred]
@@ -69,6 +72,7 @@ def _print_saved_rows(dataset_id: str, batch_index: int, total_batches: int, row
         "balance_sheet": "资产负债表",
         "income_statement": "利润表",
         "cash_flow_statement": "现金流量表",
+        "dividend_history": "分红送转历史",
     }.get(dataset_id, dataset_id)
     print(f"【已落库】{dataset_label} 第 {batch_index}/{total_batches} 批，共 {len(rows)} 条")
     keys = _preview_fields(dataset_id, spec)
@@ -228,6 +232,293 @@ def _run_price_parallel(
     return results
 
 
+def _run_financial_parallel(
+    symbols: list[str],
+    source: str,
+    spec: DatasetSpec,
+    db_path: Path,
+    max_periods: int,
+    max_workers: int = 20,
+) -> dict[str, Any]:
+    """多 fetch worker + 单 save worker：财报数据并行拉取与落库。
+
+    架构：
+      - 主线程：读 valid_codes.json → 填 task_queue → 启动所有线程
+      - fetch workers × N：task_queue.get_nowait() → HTTP + mapper → results_queue
+      - save worker × 1：results_queue.get() → 攒批 → normalize → save_dataset
+      - 进度报告线程 × 1：每 5 秒打印进度
+
+    线程安全保证：
+      - task_queue.get_nowait() 原子 pop，每只代码仅一个 worker 领取
+      - results_queue 原子 put/get，结果有序传递
+      - save_dataset 仅 save worker 单线程调用，SQLite WAL 模式无锁竞争
+    """
+    ds_id = spec.meta.dataset_id
+    total = len(symbols)
+
+    # ── 任务队列：所有股票代码 ──
+    task_queue: Queue = Queue()
+    for sym in symbols:
+        task_queue.put(sym)
+
+    # ── 结果队列：mapped 行 ──
+    results_queue: Queue = Queue()
+
+    # ── 进度追踪 ──
+    counter_lock = threading.Lock()
+    completed = [0]
+    fetch_error_count = [0]
+
+    def fetch_worker() -> None:
+        """从 task_queue 取代码 → _api_fetch → mapper → 入 results_queue。"""
+        while True:
+            try:
+                sym = task_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                rows = fetch_one_financial_record(sym, ds_id, max_periods)
+                if rows:
+                    results_queue.put(rows)
+            except Exception:
+                fetch_error_count[0] += 1
+            with counter_lock:
+                completed[0] += 1
+
+    # ── 启动 fetch workers ──
+    fetch_threads: list[Thread] = []
+    for _ in range(min(max_workers, total)):
+        t = Thread(target=fetch_worker, daemon=True, name=f"fetch-{ds_id}-{_}")
+        t.start()
+        fetch_threads.append(t)
+
+    # ── 进度报告线程 ──
+    fetch_done = threading.Event()
+
+    def progress_reporter() -> None:
+        while not fetch_done.is_set():
+            with counter_lock:
+                c = completed[0]
+            print(f"  {ds_id} {c}/{total}", flush=True)
+            time.sleep(5)
+        # 最后一次汇报
+        with counter_lock:
+            c = completed[0]
+        print(f"  {ds_id} {c}/{total} (fetch done)", flush=True)
+
+    reporter = Thread(target=progress_reporter, daemon=True, name=f"prog-{ds_id}")
+    reporter.start()
+
+    # ── save worker（唯一写 SQLite 的线程）──
+    results: dict[str, Any] = {
+        "total_row_count": 0,
+        "batch_count": 0,
+        "sample_row": None,
+        "total_required_violations": {},
+    }
+    save_batch_size = 200  # 每攒 200 行写一次
+
+    def save_worker() -> None:
+        batch_rows: list[dict[str, Any]] = []
+        batch_no = 0
+
+        while True:
+            try:
+                rows = results_queue.get(timeout=1.0)
+                batch_rows.extend(rows)
+            except Empty:
+                # 超时 → 检查是否所有 fetch worker 都已完成
+                all_fetched = all(not t.is_alive() for t in fetch_threads)
+                if all_fetched and results_queue.empty():
+                    break
+                continue
+
+            # 攒够一批就落库
+            if len(batch_rows) >= save_batch_size:
+                batch_no += 1
+                normalized = normalize_records(spec, batch_rows, source=source)
+                validation = validate_records(spec, normalized)
+                save_dataset(db_path=db_path, dataset_spec=spec, rows=normalized, replace=False)
+                results["total_row_count"] += len(normalized)
+                results["batch_count"] = batch_no
+                if results["sample_row"] is None and normalized:
+                    results["sample_row"] = _to_display_row(normalized[0], spec)
+                for key, count in validation.required_violations.items():
+                    results["total_required_violations"][key] = \
+                        results["total_required_violations"].get(key, 0) + count
+                batch_rows.clear()
+
+        # 刷新残余行
+        if batch_rows:
+            batch_no += 1
+            normalized = normalize_records(spec, batch_rows, source=source)
+            validation = validate_records(spec, normalized)
+            save_dataset(db_path=db_path, dataset_spec=spec, rows=normalized, replace=False)
+            results["total_row_count"] += len(normalized)
+            results["batch_count"] = batch_no
+            if results["sample_row"] is None and normalized:
+                results["sample_row"] = _to_display_row(normalized[0], spec)
+            for key, count in validation.required_violations.items():
+                results["total_required_violations"][key] = \
+                    results["total_required_violations"].get(key, 0) + count
+
+    save_t = Thread(target=save_worker, daemon=True, name=f"save-{ds_id}")
+    save_t.start()
+
+    # ── 等待所有 fetch worker 结束 ──
+    for t in fetch_threads:
+        t.join()
+
+    # 标记拉取完成，等待 reporter 退出
+    fetch_done.set()
+    reporter.join(timeout=2)
+
+    # ── 等待 save worker 处理完剩余数据 ──
+    save_t.join()
+
+    if fetch_error_count[0]:
+        print(f"  {ds_id} fetch errors: {fetch_error_count[0]}", flush=True)
+
+    return results
+
+
+def _run_dividend_parallel(
+    symbols: list[str],
+    source: str,
+    spec: DatasetSpec,
+    db_path: Path,
+    max_workers: int = 20,
+) -> dict[str, Any]:
+    """多 fetch worker + 单 save worker：分红历史全量并行拉取与落库。
+
+    与 _run_financial_parallel 架构一致，区别：
+      - 调用 fetch_one_dividend_record 而非 fetch_one_financial_record
+      - 不需要 max_periods 参数（分红接口用 startDate/endDate 全量拉取）
+      - 攒批阈值更高（分红记录少但跨度大，减少写入频次）
+    """
+    ds_id = spec.meta.dataset_id
+    total = len(symbols)
+
+    # ── 任务队列：所有股票代码 ──
+    task_queue: Queue = Queue()
+    for sym in symbols:
+        task_queue.put(sym)
+
+    # ── 结果队列：mapped 行 ──
+    results_queue: Queue = Queue()
+
+    # ── 进度追踪 ──
+    counter_lock = threading.Lock()
+    completed = [0]
+    fetch_error_count = [0]
+
+    def fetch_worker() -> None:
+        """从 task_queue 取代码 → _api_fetch_dividend → mapper → 入 results_queue。"""
+        while True:
+            try:
+                sym = task_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                rows = fetch_one_dividend_record(sym)
+                if rows:
+                    results_queue.put(rows)
+            except Exception:
+                fetch_error_count[0] += 1
+            with counter_lock:
+                completed[0] += 1
+
+    # ── 启动 fetch workers ──
+    fetch_threads: list[Thread] = []
+    for _ in range(min(max_workers, total)):
+        t = Thread(target=fetch_worker, daemon=True, name=f"fetch-{ds_id}-{_}")
+        t.start()
+        fetch_threads.append(t)
+
+    # ── 进度报告线程 ──
+    fetch_done = threading.Event()
+
+    def progress_reporter() -> None:
+        while not fetch_done.is_set():
+            with counter_lock:
+                c = completed[0]
+            print(f"  {ds_id} {c}/{total}", flush=True)
+            time.sleep(5)
+        with counter_lock:
+            c = completed[0]
+        print(f"  {ds_id} {c}/{total} (fetch done)", flush=True)
+
+    reporter = Thread(target=progress_reporter, daemon=True, name=f"prog-{ds_id}")
+    reporter.start()
+
+    # ── save worker（唯一写 SQLite 的线程）──
+    results: dict[str, Any] = {
+        "total_row_count": 0,
+        "batch_count": 0,
+        "sample_row": None,
+        "total_required_violations": {},
+    }
+    save_batch_size = 500  # 分红记录每只可能多行，增大攒批
+
+    def save_worker() -> None:
+        batch_rows: list[dict[str, Any]] = []
+        batch_no = 0
+
+        while True:
+            try:
+                rows = results_queue.get(timeout=1.0)
+                batch_rows.extend(rows)
+            except Empty:
+                all_fetched = all(not t.is_alive() for t in fetch_threads)
+                if all_fetched and results_queue.empty():
+                    break
+                continue
+
+            if len(batch_rows) >= save_batch_size:
+                batch_no += 1
+                normalized = normalize_records(spec, batch_rows, source=source)
+                validation = validate_records(spec, normalized)
+                save_dataset(db_path=db_path, dataset_spec=spec, rows=normalized, replace=False)
+                results["total_row_count"] += len(normalized)
+                results["batch_count"] = batch_no
+                if results["sample_row"] is None and normalized:
+                    results["sample_row"] = _to_display_row(normalized[0], spec)
+                for key, count in validation.required_violations.items():
+                    results["total_required_violations"][key] = \
+                        results["total_required_violations"].get(key, 0) + count
+                batch_rows.clear()
+
+        # 刷新残余行
+        if batch_rows:
+            batch_no += 1
+            normalized = normalize_records(spec, batch_rows, source=source)
+            validation = validate_records(spec, normalized)
+            save_dataset(db_path=db_path, dataset_spec=spec, rows=normalized, replace=False)
+            results["total_row_count"] += len(normalized)
+            results["batch_count"] = batch_no
+            if results["sample_row"] is None and normalized:
+                results["sample_row"] = _to_display_row(normalized[0], spec)
+            for key, count in validation.required_violations.items():
+                results["total_required_violations"][key] = \
+                    results["total_required_violations"].get(key, 0) + count
+
+    save_t = Thread(target=save_worker, daemon=True, name=f"save-{ds_id}")
+    save_t.start()
+
+    # ── 等待所有 fetch worker 结束 ──
+    for t in fetch_threads:
+        t.join()
+
+    fetch_done.set()
+    reporter.join(timeout=2)
+    save_t.join()
+
+    if fetch_error_count[0]:
+        print(f"  {ds_id} fetch errors: {fetch_error_count[0]}", flush=True)
+
+    return results
+
+
 def _run_ingest(
     symbols: list[str],
     source: str,
@@ -260,37 +551,27 @@ def _run_ingest(
             total_batches = r["total_batches"]
             total_required_violations = r["total_required_violations"]
 
-        # -------- 其他数据集：保持原有分批逻辑 --------
+        # -------- 分红：多线程全量拉取（20 年，不需要 max_periods）--------
+        elif spec.meta.dataset_id == "dividend_history":
+            r = _run_dividend_parallel(
+                symbols, source, spec, db_path, max_workers=batch_size,
+            )
+            total_row_count = r["total_row_count"]
+            total_rows_checked = total_row_count
+            batch_count = r["batch_count"]
+            sample_row = r["sample_row"]
+            total_required_violations = r["total_required_violations"]
+
+        # -------- 财报：多 fetch worker + 单 save worker --------
         else:
-            effective_batch = max(batch_size, 1)
-            total_batches = max(1, (len(symbols) + effective_batch - 1) // effective_batch)
-
-            for start in range(0, len(symbols), effective_batch):
-                batch_symbols = symbols[start : start + effective_batch]
-                raw_records = fetch_raw_dataset(
-                    dataset_id=spec.meta.dataset_id,
-                    symbols=batch_symbols,
-                    source=source,
-                    max_periods=max_periods,
-                )
-                normalized = normalize_records(spec, raw_records, source=source)
-                batch_validation = validate_records(spec, normalized)
-                save_dataset(
-                    db_path=db_path,
-                    dataset_spec=spec,
-                    rows=normalized,
-                    replace=False,
-                )
-                _print_saved_rows(spec.meta.dataset_id, batch_count + 1, total_batches, normalized, spec)
-
-                batch_count += 1
-                total_row_count += len(normalized)
-                total_rows_checked += batch_validation.total_rows
-                if sample_row is None and normalized:
-                    sample_row = _to_display_row(normalized[0], spec)
-
-                for key, count in batch_validation.required_violations.items():
-                    total_required_violations[key] = total_required_violations.get(key, 0) + count
+            r = _run_financial_parallel(
+                symbols, source, spec, db_path, max_periods, max_workers=batch_size,
+            )
+            total_row_count = r["total_row_count"]
+            total_rows_checked = total_row_count
+            batch_count = r["batch_count"]
+            sample_row = r["sample_row"]
+            total_required_violations = r["total_required_violations"]
 
         validation = ValidationResult(
             dataset_id=spec.meta.dataset_id,
@@ -382,6 +663,32 @@ def run_fundamental_ingest(
         max_periods=max_periods,
         batch_size=batch_size,
     )
+
+
+def run_dividend_ingest(
+    symbols: list[str],
+    source: str,
+    field_config_dir: Path,
+    db_path: Path,
+    batch_size: int = 20,
+) -> IngestRunSummary:
+    """分红送转数据入库（dividend_history）。"""
+    specs = load_specs_by_track(field_config_dir, track="financial")
+    dividend_specs = [s for s in specs if s.meta.dataset_id == "dividend_history"]
+    if not dividend_specs:
+        return IngestRunSummary(
+            db_path=db_path, source=source, track="dividend",
+            dataset_summaries=[], symbol_count=len(symbols),
+            price_success_count=0, price_success_rate=None,
+        )
+    return _run_ingest(
+        symbols=symbols, source=source, specs=dividend_specs,
+        db_path=db_path, track="dividend",
+        max_periods=1, batch_size=batch_size,
+    )
+
+
+
 
 
 

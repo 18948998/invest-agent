@@ -40,6 +40,7 @@ _TABLE_SCHEMAS: dict[str, dict[str, str]] = {
     "income_statement": {
         "symbol": "TEXT", "name": "TEXT",
         "report_date": "TEXT", "announce_date": "TEXT",
+        "report_type": "TEXT",
         "total_revenue": "REAL", "revenue": "REAL",
         "operating_cost": "REAL", "selling_expense": "REAL",
         "administrative_expense": "REAL",
@@ -54,6 +55,7 @@ _TABLE_SCHEMAS: dict[str, dict[str, str]] = {
     "balance_sheet": {
         "symbol": "TEXT", "name": "TEXT",
         "report_date": "TEXT", "announce_date": "TEXT",
+        "report_type": "TEXT",
         "cash_and_equivalents": "REAL", "accounts_receivable": "REAL",
         "inventory": "REAL", "total_current_assets": "REAL",
         "fixed_assets": "REAL", "intangible_assets": "REAL",
@@ -67,6 +69,7 @@ _TABLE_SCHEMAS: dict[str, dict[str, str]] = {
     "cash_flow_statement": {
         "symbol": "TEXT", "name": "TEXT",
         "report_date": "TEXT", "announce_date": "TEXT",
+        "report_type": "TEXT",
         "cash_inflow_from_operating_activities": "REAL",
         "cash_outflow_from_operating_activities": "REAL",
         "net_cash_flow_from_operating_activities": "REAL",
@@ -75,6 +78,18 @@ _TABLE_SCHEMAS: dict[str, dict[str, str]] = {
         "net_cash_flow_from_financing_activities": "REAL",
         "net_increase_in_cash_and_equivalents": "REAL",
         "ending_cash_and_equivalents_balance": "REAL",
+    },
+    "dividend_history": {
+        "symbol": "TEXT", "name": "TEXT",
+        "plan_profile": "TEXT",
+        "pretax_bonus_per_share": "REAL",
+        "bonus_share_ratio": "REAL",
+        "assign_progress": "TEXT",
+        "plan_notice_date": "TEXT",
+        "equity_record_date": "TEXT",
+        "ex_dividend_date": "TEXT",
+        "implement_notice_date": "TEXT",
+        "report_date": "TEXT",
     },
 }
 
@@ -234,33 +249,43 @@ basic_info（基础信息 + 估值）—— symbol, name, market, industry, list
   current_price, pe_ttm, pb, ps_ttm, market_cap, eps_basic, eps_ttm,
   bvps, dividend_per_share, dividend_payout_ratio, dividend_yield, roe
 
-income_statement（利润表）—— symbol, name, report_date, announce_date, total_revenue,
-  revenue, operating_cost, selling_expense, administrative_expense,
+income_statement（利润表）—— symbol, name, report_date, announce_date, report_type,
+  total_revenue, revenue, operating_cost, selling_expense, administrative_expense,
   research_and_development_expense, financial_expense, operating_profit,
   total_profit, income_tax_expense, net_profit,
   net_profit_attributable_to_parent, net_profit_excluding_non_recurring,
   eps_basic, eps_diluted
 
-balance_sheet（资产负债表）—— symbol, name, report_date, announce_date,
+balance_sheet（资产负债表）—— symbol, name, report_date, announce_date, report_type,
   cash_and_equivalents, accounts_receivable, inventory, total_current_assets,
   fixed_assets, intangible_assets, goodwill, total_assets,
   short_term_borrowings, total_current_liabilities, long_term_borrowings,
   total_liabilities, share_capital, retained_earnings, equity_attributable_to_parent
 
-cash_flow_statement（现金流量表）—— symbol, name, report_date, announce_date,
+cash_flow_statement（现金流量表）—— symbol, name, report_date, announce_date, report_type,
   cash_inflow_from_operating_activities, cash_outflow_from_operating_activities,
   net_cash_flow_from_operating_activities, cash_paid_for_long_term_assets,
   net_cash_flow_from_investing_activities, net_cash_flow_from_financing_activities,
   net_increase_in_cash_and_equivalents, ending_cash_and_equivalents_balance
 
+dividend_history（分红送转历史）—— symbol, name, plan_profile, pretax_bonus_per_share,
+  bonus_share_ratio, assign_progress, plan_notice_date, equity_record_date,
+  ex_dividend_date, implement_notice_date, report_date
+
 多表 JOIN 示例：
   LEFT JOIN income_statement   ON basic_info.symbol = income_statement.symbol
   LEFT JOIN balance_sheet      ON basic_info.symbol = balance_sheet.symbol
   LEFT JOIN cash_flow_statement ON basic_info.symbol = cash_flow_statement.symbol
+  LEFT JOIN dividend_history   ON basic_info.symbol = dividend_history.symbol
 
 Tips：
   - 财报表（income_statement/balance_sheet/cash_flow_statement）有多期数据，
     查最新一期请用 ORDER BY report_date DESC LIMIT 1 或子查询。
+  - dividend_history 表中每行为一次分红/送转事件，按 plan_notice_date 排序。
+    查某只股票历年分红：SELECT plan_notice_date, plan_profile, pretax_bonus_per_share
+    FROM dividend_history WHERE symbol = '600519' ORDER BY plan_notice_date DESC
+  - 财报表含 report_type 字段：值为 "年度报告" 或 "半年度报告"。
+    筛选和分析时请默认加 WHERE report_type='年度报告'，只取年报数据。
   - 用 GROUP BY symbol 配合 MAX(report_date) 可获取每只股票的最新报告期。
   - basic_info 每只股票只有一行，可直接 JOIN。
 
@@ -314,6 +339,7 @@ Args:
         "income_statement": "利润表（多期，按 report_date 区分）",
         "balance_sheet": "资产负债表（多期，按 report_date 区分）",
         "cash_flow_statement": "现金流量表（多期，按 report_date 区分）",
+        "dividend_history": "分红送转历史（每次分红/送转事件一行，1990年至今）",
     }
 
     join_guide = """
@@ -322,18 +348,20 @@ Args:
 ## 表关联关系
 所有表通过 `symbol` 字段关联。财报三表额外需要用 `report_date` 对齐报告期。
 
-### 获取每只股票最新财报的典型写法：
+### 获取每只股票最新年报的典型写法：
 ```sql
 SELECT b.symbol, b.name, b.pe_ttm, i.net_profit, bs.total_assets
 FROM basic_info b
 LEFT JOIN (
     SELECT symbol, MAX(report_date) AS latest_date
-    FROM income_statement GROUP BY symbol
+    FROM income_statement
+    WHERE report_type = '年度报告'
+    GROUP BY symbol
 ) latest ON b.symbol = latest.symbol
 LEFT JOIN income_statement i
-    ON b.symbol = i.symbol AND i.report_date = latest.latest_date
+    ON b.symbol = i.symbol AND i.report_date = latest.latest_date AND i.report_type = '年度报告'
 LEFT JOIN balance_sheet bs
-    ON b.symbol = bs.symbol AND bs.report_date = latest.latest_date
+    ON b.symbol = bs.symbol AND bs.report_date = latest.latest_date AND bs.report_type = '年度报告'
 WHERE b.pe_ttm > 0 AND b.pe_ttm < 30
 ORDER BY b.pe_ttm ASC
 LIMIT 20
